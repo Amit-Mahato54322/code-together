@@ -30,4 +30,3 @@ export function CodeEditor(props:CodeEditorProps){
     )
 }
 
-// a code editor with monaco is now ready, next step is to connect this component to the actual application. 
