@@ -1,4 +1,4 @@
-import type { Room } from "../domain/room";
+import type { Room } from "../domain/room.js";
 
 // ## store ##:
 // separate store to store the rooms using a hashmap

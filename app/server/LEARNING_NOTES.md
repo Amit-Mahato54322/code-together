@@ -86,3 +86,32 @@ future HTTP/WebSocket handler
   5. Return the Participant.
 - RoomService does not know anything about HTTP status codes yet.
 - For this small project, directly mutating the in-memory Room object is acceptable and keeps the code simple.
+
+
+
+## Node + Express Server Foundation
+
+- The frontend and backend are separate applications and have separate package.json files.
+- Express is the HTTP framework used by the backend.
+- `src/index.ts` is the backend entry point.
+- `tsx` runs TypeScript directly during development and can restart the server when files change.
+- `tsconfig.json` controls how TypeScript is checked and compiled.
+- `src/` contains TypeScript source code.
+- `dist/` will contain compiled JavaScript.
+- `app.use(express.json())` is middleware that parses JSON request bodies.
+- A route consists of an HTTP method and path, such as `GET /health`.
+- `response.json()` sends JSON back to the client.
+- `app.listen(3000)` starts the backend on port 3000.
+- The frontend and backend run as separate processes:
+  - frontend: localhost:5173
+  - backend: localhost:3000
+
+
+
+## Backend Build
+
+- `npm run dev` runs TypeScript directly with tsx for development.
+- `npm run build` uses the TypeScript compiler (`tsc`) to compile all backend source files.
+- Compiled JavaScript goes into `dist/`.
+- `npm start` runs the compiled JavaScript from `dist/`.
+- A backend can run in development while another TypeScript file still contains compile errors, so production build validation is an important checkpoint.

@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import type {
-  ProgrammingLanguage,
-  Room,
-} from "../domain/room";
+import type{
+    ProgrammingLanguage,
+    Room,
+    EditorState,
+} from "../domain/room.ts"
 
-import type { Participant } from "../domain/participant";
+import type { Participant } from "../domain/participant.js";
 
-import { RoomStore } from "../store/roomStore";
-import { ParticipantStore } from "../store/participantStore";
+import { RoomStore } from "../store/roomStore.js";
+import { ParticipantStore } from "../store/participantStore.js";
 
 export class RoomService {
   constructor(

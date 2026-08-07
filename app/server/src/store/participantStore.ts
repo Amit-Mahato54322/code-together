@@ -1,4 +1,4 @@
-import type { Participant } from "../domain/participant";
+import type { Participant } from "../domain/participant.js";
 export class ParticipantStore{
 
     // ## separate store to store participants and their information ##
