@@ -132,3 +132,13 @@ future HTTP/WebSocket handler
 - `isProgrammingLanguage()` is a type guard that checks whether a value is one of the supported languages.
 - `201 Created` is returned when room creation succeeds.
 - `400 Bad Request` is returned for an unsupported language.
+
+## GET /rooms/:roomId
+
+- `:roomId` is a dynamic route parameter.
+- Express exposes route parameters through `request.params`.
+- `RoomService.getRoom()` returns either a Room or undefined.
+- The route converts:
+  - existing Room -> 200 OK
+  - missing Room -> 404 Not Found
+- The service layer does not know about HTTP status codes.

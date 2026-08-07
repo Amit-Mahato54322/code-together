@@ -4,6 +4,7 @@ import type { ProgrammingLanguage } from "./domain/room.js";
 import { ParticipantStore } from "./store/participantStore.js";
 import { RoomStore } from "./store/roomStore.js";
 import { RoomService } from "./services/roomService.js";
+import { PassThrough } from "node:stream";
 
 //create express application
 const app = express();
@@ -47,7 +48,6 @@ function isProgrammingLanguage(value: unknown): value is ProgrammingLanguage {
 
 }
 
-
 // health-check endpoint. 
 // GET/health lets us verify that the server is running.
 
@@ -78,6 +78,28 @@ app.post("/rooms",(request, response)=>{
 
     //201 means a new resource was successfully created. 
     response.status(201).json(room);
+})
+
+// Get an existing room by its unique room ID.
+app.get("/room/:roomId", (request, response)=>{
+    //Route parameters come from the URL
+    //e.g., GET/rooms/abc123
+    // request.params.roomID === "abc123"
+
+    const roomId = request.params.roomId;
+    const room = roomService.getRoom(roomId)
+
+    // if RoomService cannot find the room, 
+    // return HTTP 404 Not Found.
+    if(!room){
+        response.status(404).json({
+            error: "Room not found"
+        })
+        return;
+    }
+
+    response.status(200).json(room);
+
 })
 
 //start listening for HTTP requests. 
