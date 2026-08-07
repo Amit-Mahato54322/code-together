@@ -59,7 +59,7 @@ app.get("/health", (_request, response) => (  //_ means it's not being used, int
 
 
 // create a new collaborative room.
-app.post("/rooms",(request, response)=>{
+app.post("/room",(request, response)=>{
     const language = request.body.language;
 
     //if client sent a language, make sure it is supported. 
@@ -100,6 +100,37 @@ app.get("/room/:roomId", (request, response)=>{
 
     response.status(200).json(room);
 
+})
+
+//Join an existing room as a participant.
+app.post("/room/:roomId/join", (request, response)=>{
+    const roomId = request.params.roomId;
+    const displayName = request.body.displayName;
+
+    //Basic runtime validation:
+    //the client must send a non-empty display name. 
+    if(
+        typeof displayName!== "string" || displayName.trim().length === 0
+    ){
+        response.status(400).json({
+            error: "Display name is required"
+        });
+
+        return;
+    }
+    const participant = roomService.joinRoom(
+        roomId,
+        displayName.trim()
+    );
+
+    // joinRoom() returns undefined when the room does not exist. 
+    if (!participant){
+        response.status(404).json({
+            error: "Room not found",
+        });
+        return;
+    }
+    response.status(201).json(participant)
 })
 
 //start listening for HTTP requests. 

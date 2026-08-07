@@ -142,3 +142,18 @@ future HTTP/WebSocket handler
   - existing Room -> 200 OK
   - missing Room -> 404 Not Found
 - The service layer does not know about HTTP status codes.
+
+
+## POST /rooms/:roomId/join
+
+- This endpoint lets a participant join an existing room.
+- `roomId` comes from `request.params`.
+- `displayName` comes from `request.body`.
+- External request data must be validated at runtime.
+- `trim()` removes unnecessary whitespace from user input.
+- The route calls `RoomService.joinRoom()` instead of directly modifying stores.
+- Responses:
+  - 201 -> participant created
+  - 400 -> invalid display name
+  - 404 -> room does not exist
+- After joining, the Participant is stored separately and its ID is added to the Room.
