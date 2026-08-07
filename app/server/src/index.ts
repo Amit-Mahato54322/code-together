@@ -1,4 +1,5 @@
 import express from "express"
+import cors from "cors";
 
 import type { ProgrammingLanguage } from "./domain/room.js";
 import { ParticipantStore } from "./store/participantStore.js";
@@ -29,6 +30,13 @@ const roomService = new RoomService(
 // Middleware that allows Express to understand JSON request bodies. 
 // we will need need it when clients send data to the server.
 
+
+// Allow our react development server to make requests to this backend from the browser. 
+app.use(cors({
+    origin: "http://localhost:5173",
+}));
+
+//parse incoming JSON request bodies
 app.use(express.json());
 
 
