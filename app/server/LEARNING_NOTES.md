@@ -115,3 +115,20 @@ future HTTP/WebSocket handler
 - Compiled JavaScript goes into `dist/`.
 - `npm start` runs the compiled JavaScript from `dist/`.
 - A backend can run in development while another TypeScript file still contains compile errors, so production build validation is an important checkpoint.
+
+
+## POST /rooms
+
+- `POST /rooms` creates a new collaborative room.
+- The HTTP route calls `RoomService` instead of creating rooms directly.
+- `index.ts` is where the app is assembled:
+  - create stores
+  - create services
+  - register routes
+  - start server
+- `express.json()` parses incoming JSON bodies.
+- HTTP data must be validated at runtime because TypeScript only checks source code.
+- `unknown` is useful for untrusted values.
+- `isProgrammingLanguage()` is a type guard that checks whether a value is one of the supported languages.
+- `201 Created` is returned when room creation succeeds.
+- `400 Bad Request` is returned for an unsupported language.
