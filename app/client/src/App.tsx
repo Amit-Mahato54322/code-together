@@ -52,6 +52,9 @@ function App() {
   const [displayName, setDisplayName] =
     useState<string | null>(null);
 
+  // Tracks the current Websocket connection state for the UI.
+  const [socketStatus, setSocketStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+
 
   //when the application first loads, check whether the URL already contains a room ID.
   //This lets someone open a shared /rooms/:roomId link directly.
@@ -88,6 +91,48 @@ function App() {
 
     void loadRoom();
   }, []);
+
+  // Open a WebSocket connection after this browser
+  // has successfully joined a room.
+  useEffect(() => {
+    // We cannot start a room connection until we know
+    // both which room we are in and who this participant is.
+    if (!roomId || !participantId) {
+      return;
+    }
+
+    setSocketStatus("connecting");
+
+    const socket = new WebSocket("ws://localhost:3000");
+
+    // Runs when the WebSocket connection is successfully established.
+    socket.onopen = () => {
+      console.log("WebSocket connected");
+      setSocketStatus("connected");
+    };
+
+    // Runs whenever the backend sends us a WebSocket message.
+    socket.onmessage = (event) => {
+      console.log("WebSocket message:", event.data);
+    };
+
+    // Runs when the WebSocket connection closes.
+    socket.onclose = () => {
+      console.log("WebSocket disconnected");
+      setSocketStatus("disconnected");
+    };
+
+    // Runs if the browser encounters a WebSocket-level error.
+    socket.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    // React calls this cleanup function when the effect
+    // is removed or when the component is destroyed.
+    return () => {
+      socket.close();
+    };
+  }, [roomId, participantId]);
 
   const activeLanguage =
     LANGUAGE_OPTIONS.find((option) => option.id === language) ??
@@ -196,13 +241,11 @@ function App() {
           <div className="connection-status">
             <span className="status-dot" />
 
-            {
-              participantId ?
-                `Joined as ${displayName}`
-                : roomId
-                  ? "RoomLoaded"
-                  : "Local session"
-            }
+            {participantId
+              ? `${displayName} · ${socketStatus}`
+              : roomId
+                ? "Room loaded"
+                : "Local session"}
           </div>
         </div>
       </header>

@@ -220,3 +220,30 @@ future HTTP/WebSocket handler
 - Room ID identifies the collaboration room.
 - Participant ID identifies one person/session inside that room.
 - This identity will later be used for WebSocket presence and code updates.
+
+
+
+## WebSocket Foundation
+
+- HTTP usually follows request -> response -> connection finishes.
+- WebSockets create a persistent two-way connection between browser and server.
+- `ws` provides WebSocket support for our Node backend.
+- We use `createServer(app)` so Express HTTP routes and WebSockets can share port 3000.
+- `WebSocketServer` listens for WebSocket connections.
+- The `connection` event runs when a browser connects.
+- `socket.send()` sends a message to that browser.
+- The `close` event runs when the browser disconnects.
+- WebSocket messages are commonly serialized using JSON.
+- WebSockets begin with an HTTP upgrade handshake.
+
+
+## React WebSocket Connection
+
+- React opens the WebSocket only after the browser has joined a room.
+- The WebSocket effect depends on `roomId` and `participantId`.
+- `new WebSocket("ws://localhost:3000")` starts the persistent connection.
+- `onopen` means the connection is ready.
+- `onmessage` receives messages from the backend.
+- `onclose` runs when the connection ends.
+- `useEffect` cleanup closes the socket so stale connections are not left open.
+- WebSocket connection state is stored in React so the UI can show connecting/connected/disconnected.

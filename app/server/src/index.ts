@@ -1,5 +1,7 @@
 import express from "express"
 import cors from "cors";
+import { createServer } from "node:http";
+import { WebSocketServer } from "ws";
 
 import type { ProgrammingLanguage } from "./domain/room.js";
 import { ParticipantStore } from "./store/participantStore.js";
@@ -141,14 +143,54 @@ app.post("/rooms/:roomId/join", (request, response)=>{
     response.status(201).json(participant)
 })
 
-//start listening for HTTP requests. 
-app.listen(PORT, ()=>{
-    console.log(
-        `Code together server running on http://localhost:${PORT}`
-    )
+    //        port 3000
+    //            │
+    //      Node HTTP server
+    //       /           \
+    //      /             \
+    //     ▼               ▼
+    // Express         WebSocket
+    // routes           server
+
+    
+
+// Express defines how HTTP requests are handled, 
+// but we create the actual Node HTTP server ourselves
+//  so that HTTP and WebSocket traffic can use the same port 
+
+const httpServer = createServer(app);
+
+// attach a websocket server to the existing HTTP server
+const webSocketServer = new WebSocketServer({
+    server: httpServer,
+});
+// This event runs whenever a browser establishes
+// a new WebSocket connection with our backend. 
+
+webSocketServer.on("connection", (socket)=>{
+    console.log("Websocket client connected");
+
+    // send a small message back so the browser can confirm that the persistent connection is working. 
+
+    socket.send(
+        JSON.stringify({
+            type: "connection:ready",
+        })
+    );
+
+    // The socket stays open until the client disconnects.
+    socket.on("close", ()=>{
+        console.log("Websocket client disconnected");
+    });
 });
 
-// start the http server and begin listening for requests. 
-app.listen(PORT, () => {
-    console.log(`Code Together server running on http://localhost:${PORT}`)
+// start one server that handles both:
+// -normal HTTP requests
+// -Websocket connections
+httpServer.listen(PORT, ()=>{
+    console.log(
+
+        `Code together server running on http://localhost:${PORT}`
+    );
 });
+
