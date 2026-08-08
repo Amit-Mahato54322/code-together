@@ -16,6 +16,12 @@ export interface Room {
   createdAt: number;
 }
 
+export interface Participant{
+  id: string;
+  displayName: string;
+  joinedAt: number;
+}
+
 const API_URL = "http://localhost:3000";
 
 // Ask the backend to create a new collaborative room.
@@ -57,4 +63,34 @@ export async function getRoom(roomId: string): Promise<Room> {
   const room: Room = await response.json();
 
   return room;
+}
+
+
+// Join an existing room using a display name. 
+
+export async function joinRoom(
+  roomId: string,
+  displayName: string,
+
+): Promise<Participant>{
+
+  const response = await fetch(
+    `${API_URL}/rooms/${roomId}/join`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type":"application/json",
+      },
+      body: JSON.stringify({
+        displayName,
+      }),
+    }
+  );
+
+  if (!response.ok){
+    throw new Error("Failed to join room");
+  }
+  const participant: Participant = await response.json();
+  return participant;
+
 }

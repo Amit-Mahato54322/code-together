@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { createRoom, getRoom } from "./api/rooms";
+import { createRoom, getRoom, joinRoom } from "./api/rooms";
 import { CodeEditor } from "./components/CodeEditor";
 import { LanguageSelector } from "./components/LanguageSelector";
 
@@ -44,42 +44,50 @@ function App() {
   // Used to disable the button while the HTTP request is running.
   const [isCreatingRoom, setIsCreatingRoom] = useState(false);
 
+  // The participant ID identifies this browser session inside the room.
+  const [participantId, setParticipantId] =
+    useState<string | null>(null);
+
+  // Used only for displaying who joined.
+  const [displayName, setDisplayName] =
+    useState<string | null>(null);
+
 
   //when the application first loads, check whether the URL already contains a room ID.
   //This lets someone open a shared /rooms/:roomId link directly.
-// When the application first loads, check whether the URL
-// already contains a room ID.
-//
-// This lets someone open a shared /rooms/:roomId link directly.
-useEffect(() => {
-  const roomIdFromUrl = getRoomIdFromUrl();
+  // When the application first loads, check whether the URL
+  // already contains a room ID.
+  //
+  // This lets someone open a shared /rooms/:roomId link directly.
+  useEffect(() => {
+    const roomIdFromUrl = getRoomIdFromUrl();
 
-  // If this is just the normal homepage, there is no room to load.
-  if (!roomIdFromUrl) {
-    return;
-  }
-
-  async function loadRoom() {
-    try {
-      const room = await getRoom(roomIdFromUrl);
-
-      // Store the room ID so the UI knows we are inside a room.
-      setRoomId(room.id);
-
-      // Load the server's current editor state.
-      setCode(room.editorState.code);
-      setLanguage(room.editorState.language);
-    } catch (error) {
-      console.error("Could not load room:", error);
-
-      alert(
-        "Could not load this room. It may not exist anymore."
-      );
+    // If this is just the normal homepage, there is no room to load.
+    if (!roomIdFromUrl) {
+      return;
     }
-  }
 
-  void loadRoom();
-}, []);
+    async function loadRoom() {
+      try {
+        const room = await getRoom(roomIdFromUrl);
+
+        // Store the room ID so the UI knows we are inside a room.
+        setRoomId(room.id);
+
+        // Load the server's current editor state.
+        setCode(room.editorState.code);
+        setLanguage(room.editorState.language);
+      } catch (error) {
+        console.error("Could not load room:", error);
+
+        alert(
+          "Could not load this room. It may not exist anymore."
+        );
+      }
+    }
+
+    void loadRoom();
+  }, []);
 
   const activeLanguage =
     LANGUAGE_OPTIONS.find((option) => option.id === language) ??
@@ -120,6 +128,31 @@ useEffect(() => {
     }
   }
 
+  //join the currently loaded room as a participant. 
+  async function handleJoinRoom() {
+    if (!roomId) {
+      return;
+    }
+
+    // prompt() can later be replaced with proper join form. 
+    const name = window.prompt("Enter your display name:");
+    if (!name || name.trim().length === 0) {
+      return;
+    }
+
+    try {
+      const participant = await joinRoom(
+        roomId,
+        name.trim()
+      );
+      setParticipantId(participant.id);
+      setDisplayName(participant.displayName);
+    } catch (error) {
+      console.error("Could not join room: ", error);
+      alert("Could not join this room.");
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -150,10 +183,26 @@ useEffect(() => {
             {isCreatingRoom ? "Creating..." : "Create Room"}
           </button>
 
+          {roomId && !participantId && (
+            <button
+              className="create-room-button"
+              type="button"
+              onClick={handleJoinRoom}
+            >
+              Join Room
+            </button>
+          )}
+
           <div className="connection-status">
             <span className="status-dot" />
 
-            {roomId ? "Room created" : "Local session"}
+            {
+              participantId ?
+                `Joined as ${displayName}`
+                : roomId
+                  ? "RoomLoaded"
+                  : "Local session"
+            }
           </div>
         </div>
       </header>

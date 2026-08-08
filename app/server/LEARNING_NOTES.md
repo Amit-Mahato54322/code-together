@@ -209,3 +209,14 @@ future HTTP/WebSocket handler
   - programming language
 - This allows someone to open a shared room link directly.
 - Network requests are side effects, so they are performed inside `useEffect`.
+
+
+## Joining a Shared Room
+
+- A browser first loads a room using GET /rooms/:roomId.
+- Joining is a separate action using POST /rooms/:roomId/join.
+- The backend creates a Participant and returns its ID.
+- React stores the participant ID for the current browser session.
+- Room ID identifies the collaboration room.
+- Participant ID identifies one person/session inside that room.
+- This identity will later be used for WebSocket presence and code updates.
