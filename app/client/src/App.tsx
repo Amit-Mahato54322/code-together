@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 
 import { createRoom, getRoom, joinRoom } from "./api/rooms";
 import { CodeEditor } from "./components/CodeEditor";
@@ -55,6 +55,9 @@ function App() {
   // Tracks the current Websocket connection state for the UI.
   const [socketStatus, setSocketStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
 
+  // A ref lets us keep the WebSocket object between renders
+  // without causing a re-render whenever the socket changes.
+  const socketRef = useRef<WebSocket | null>(null);
 
   //when the application first loads, check whether the URL already contains a room ID.
   //This lets someone open a shared /rooms/:roomId link directly.
@@ -65,19 +68,20 @@ function App() {
   useEffect(() => {
     const roomIdFromUrl = getRoomIdFromUrl();
 
-    // If this is just the normal homepage, there is no room to load.
+    // If the URL does not contain a room ID,
+    // there is no room to load.
     if (!roomIdFromUrl) {
       return;
     }
 
-    async function loadRoom() {
+    // Pass the already-validated room ID into this function.
+    // Because the parameter type is string, TypeScript now knows
+    // it cannot be null.
+    async function loadRoom(roomId: string) {
       try {
-        const room = await getRoom(roomIdFromUrl);
+        const room = await getRoom(roomId);
 
-        // Store the room ID so the UI knows we are inside a room.
         setRoomId(room.id);
-
-        // Load the server's current editor state.
         setCode(room.editorState.code);
         setLanguage(room.editorState.language);
       } catch (error) {
@@ -89,7 +93,7 @@ function App() {
       }
     }
 
-    void loadRoom();
+    void loadRoom(roomIdFromUrl);
   }, []);
 
   // Open a WebSocket connection after this browser
@@ -105,15 +109,55 @@ function App() {
 
     const socket = new WebSocket("ws://localhost:3000");
 
+    // Keep this WebSocket available to other functions
+    // inside the component.
+    socketRef.current = socket;
+
     // Runs when the WebSocket connection is successfully established.
     socket.onopen = () => {
       console.log("WebSocket connected");
-      setSocketStatus("connected");
+
+      // The network connection is open,
+      // but we still need the server to accept our room:join.
+      socket.send(
+        JSON.stringify({
+          type: "room:join",
+          roomId,
+          participantId,
+        })
+      );
     };
 
     // Runs whenever the backend sends us a WebSocket message.
     socket.onmessage = (event) => {
-      console.log("WebSocket message:", event.data);
+      try {
+        const message = JSON.parse(event.data);
+
+        console.log(
+          "WebSocket message:",
+          message
+        );
+
+        // The server confirmed that this WebSocket
+        // is now attached to the room.
+        if (message.type === "room:joined") {
+          setSocketStatus("connected");
+          return;
+        }
+
+        // Another collaborator changed the code.
+        if (
+          message.type === "code:update" &&
+          typeof message.code === "string"
+        ) {
+          setCode(message.code);
+        }
+      } catch (error) {
+        console.error(
+          "Could not parse WebSocket message:",
+          error
+        );
+      }
     };
 
     // Runs when the WebSocket connection closes.
@@ -131,6 +175,10 @@ function App() {
     // is removed or when the component is destroyed.
     return () => {
       socket.close();
+
+      // Do not leave a reference pointing at
+      // a WebSocket that has already been closed.
+      socketRef.current = null;
     };
   }, [roomId, participantId]);
 
@@ -195,6 +243,30 @@ function App() {
     } catch (error) {
       console.error("Could not join room: ", error);
       alert("Could not join this room.");
+    }
+  }
+
+
+  // Runs every time the local user changes the Monaco editor.
+  function handleCodeChange(newCode: string) {
+    // Update this browser immediately.
+    setCode(newCode);
+
+    const socket = socketRef.current;
+
+    // Only send the update after our socket has been
+    // successfully attached to the room.
+    if (
+      socket &&
+      socket.readyState === WebSocket.OPEN &&
+      socketStatus === "connected"
+    ) {
+      socket.send(
+        JSON.stringify({
+          type: "code:update",
+          code: newCode,
+        })
+      );
     }
   }
 
@@ -281,7 +353,7 @@ function App() {
             <CodeEditor
               language={language}
               value={code}
-              onChange={setCode}
+              onChange={handleCodeChange}
             />
           </div>
         </section>

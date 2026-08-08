@@ -247,3 +247,31 @@ future HTTP/WebSocket handler
 - `onclose` runs when the connection ends.
 - `useEffect` cleanup closes the socket so stale connections are not left open.
 - WebSocket connection state is stored in React so the UI can show connecting/connected/disconnected.
+
+
+## Attaching WebSockets to Rooms
+
+- Opening a WebSocket only creates a network connection.
+- The browser sends a `room:join` message containing roomId and participantId.
+- The backend verifies that:
+  - the room exists
+  - the participant belongs to the room
+- `Map<string, Set<WebSocket>>` groups active WebSocket connections by room.
+- A Set prevents duplicate socket entries and makes removal easy.
+- HTTP participant identity and WebSocket connection identity are separate concepts.
+- When a socket disconnects, it is removed from the room's connection Set.
+- Once sockets are grouped by room, the server can broadcast messages only to collaborators in that room.
+
+
+## Live Code Synchronization
+
+- Monaco calls `handleCodeChange()` whenever the local user edits code.
+- `useRef()` stores the current WebSocket object without triggering React renders.
+- Local edits update React state immediately.
+- When the WebSocket is connected, the browser sends a `code:update` message.
+- The backend updates the Room's canonical editor state and increments its revision.
+- The backend broadcasts the update to every other WebSocket connected to that room.
+- Other browsers receive `code:update` and call `setCode()`, which updates Monaco.
+- The sender is excluded from the broadcast because its editor already contains the change.
+- The current implementation sends the whole code document on every change.
+- Simultaneous edits currently behave roughly as last-write-wins; advanced conflict resolution can be added later if needed.
