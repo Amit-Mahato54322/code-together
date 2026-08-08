@@ -146,6 +146,8 @@ future HTTP/WebSocket handler
 
 ## POST /rooms/:roomId/join
 
+- app/client/src/api/rooms.ts
+
 - This endpoint lets a participant join an existing room.
 - `roomId` comes from `request.params`.
 - `displayName` comes from `request.body`.
@@ -157,3 +159,53 @@ future HTTP/WebSocket handler
   - 400 -> invalid display name
   - 404 -> room does not exist
 - After joining, the Participant is stored separately and its ID is added to the Room.
+
+
+
+## Frontend to Backend Communication
+
+- Frontend runs on localhost:5173 and backend runs on localhost:3000.
+- Because they use different ports, the browser treats them as different origins.
+- CORS allows the backend to explicitly permit requests from the frontend.
+- React uses the browser `fetch()` API to make HTTP requests.
+- `async` functions return Promises.
+- `await` waits for asynchronous operations such as network requests.
+- `JSON.stringify()` converts JavaScript objects into JSON before sending them.
+- Express `express.json()` parses incoming JSON back into request.body.
+- `fetch()` does not automatically throw for HTTP errors like 400 or 404, so `response.ok` should be checked.
+
+
+## Creating a Room from React
+
+- Clicking Create Room runs an async React event handler.
+- The handler calls `createRoom(language)` from `api/rooms.ts`.
+- `createRoom()` sends `POST /rooms` to the Express backend.
+- The backend generates the real room UUID and returns the Room.
+- React stores the returned ID using `roomId` state.
+- `string | null` represents whether a room has been created yet.
+- `isCreatingRoom` disables the button while the request is running.
+- `try/catch/finally` handles success, errors, and cleanup.
+- This is the first complete frontend -> backend -> frontend round trip.
+
+## Shareable Room URL
+
+- After creating a room, the frontend receives a backend-generated room ID.
+- `window.history.pushState()` changes the browser URL without refreshing the page.
+- A created room now gets a URL like `/rooms/<roomId>`.
+- This URL will later be shared with another user.
+- We are not using React Router yet because the routing needs are still simple.
+
+
+## Loading a Shared Room
+
+- A room URL looks like `/rooms/<roomId>`.
+- `window.location.pathname` lets the frontend inspect the current URL.
+- `getRoomIdFromUrl()` extracts the room ID from the path.
+- `useEffect(..., [])` runs once when App first loads.
+- If a room ID exists in the URL, React calls `GET /rooms/:roomId`.
+- The returned room updates:
+  - roomId
+  - editor code
+  - programming language
+- This allows someone to open a shared room link directly.
+- Network requests are side effects, so they are performed inside `useEffect`.

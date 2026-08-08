@@ -67,7 +67,7 @@ app.get("/health", (_request, response) => (  //_ means it's not being used, int
 
 
 // create a new collaborative room.
-app.post("/room",(request, response)=>{
+app.post("/rooms",(request, response)=>{
     const language = request.body.language;
 
     //if client sent a language, make sure it is supported. 
@@ -89,7 +89,7 @@ app.post("/room",(request, response)=>{
 })
 
 // Get an existing room by its unique room ID.
-app.get("/room/:roomId", (request, response)=>{
+app.get("/rooms/:roomId", (request, response)=>{
     //Route parameters come from the URL
     //e.g., GET/rooms/abc123
     // request.params.roomID === "abc123"
@@ -111,7 +111,7 @@ app.get("/room/:roomId", (request, response)=>{
 })
 
 //Join an existing room as a participant.
-app.post("/room/:roomId/join", (request, response)=>{
+app.post("/rooms/:roomId/join", (request, response)=>{
     const roomId = request.params.roomId;
     const displayName = request.body.displayName;
 
