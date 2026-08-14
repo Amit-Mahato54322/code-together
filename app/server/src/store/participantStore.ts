@@ -14,7 +14,7 @@ export class ParticipantStore{
     }
 
     //return participant if it exists.
-    // if no participant has this ID, Map.get() returns undefined. 
+    // if no participant has this ID, Map.get() returns undefined.
 
     get(participantId:string): Participant | undefined{
         return this.participants.get(participantId);
@@ -30,7 +30,7 @@ export class ParticipantStore{
         return this.participants.delete(participantId);
     }
 
-    // getter to return participantStore.sizxe 
+    // getter to return participantStore.sizxe
     get size(): number{
         return this.participants.size;
     }

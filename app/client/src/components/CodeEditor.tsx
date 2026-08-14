@@ -27,7 +27,7 @@ export function CodeEditor(props:CodeEditorProps){
                 readOnly: props.readOnly,
             }
         }
-        
+
         />
     )
 }

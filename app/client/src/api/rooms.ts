@@ -68,7 +68,7 @@ export async function getRoom(roomId: string): Promise<Room> {
 }
 
 
-// Join an existing room using a display name. 
+// Join an existing room using a display name.
 
 export async function joinRoom(
   roomId: string,

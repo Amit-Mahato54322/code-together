@@ -1,6 +1,6 @@
 // create the language configuration module
 
-export type ProgrammingLanguage = 
+export type ProgrammingLanguage =
 |"typescript"
 |"javascript"
 |"python";

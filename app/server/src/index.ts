@@ -11,7 +11,7 @@ import { RoomService } from "./services/roomService.js";
 //create express application
 const app = express();
 
-// define a port where backend listens for HTTP requests. 
+// define a port where backend listens for HTTP requests.
 
 const PORT = Number(process.env.PORT ?? 3000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
@@ -31,11 +31,11 @@ const roomService = new RoomService(
 
 
 
-// Middleware that allows Express to understand JSON request bodies. 
+// Middleware that allows Express to understand JSON request bodies.
 // we will need need it when clients send data to the server.
 
 
-// Allow our react development server to make requests to this backend from the browser. 
+// Allow our react development server to make requests to this backend from the browser.
 app.use(cors({
     origin: CLIENT_ORIGIN,
 }));
@@ -75,10 +75,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// health-check endpoint. 
+// health-check endpoint.
 // GET/health lets us verify that the server is running.
 
-app.get("/health", (_request, response) => (  //_ means it's not being used, intentionally 
+app.get("/health", (_request, response) => (  //_ means it's not being used, intentionally
     response.json({
         status: "ok",
     })
@@ -91,7 +91,7 @@ app.post("/rooms", (request, response) => {
     const language = body.language;
     const code = body.code ?? "";
 
-    //if client sent a language, make sure it is supported. 
+    //if client sent a language, make sure it is supported.
     if (
         language !== undefined && !isProgrammingLanguage(language)
     ) {
@@ -112,7 +112,7 @@ app.post("/rooms", (request, response) => {
     // the new too to Typescript.
     const room = roomService.createRoom(language, code);
 
-    //201 means a new resource was successfully created. 
+    //201 means a new resource was successfully created.
     response.status(201).json(room);
 })
 
@@ -131,7 +131,7 @@ app.get("/rooms/:roomId", (request, response) => {
 
     const room = roomService.getRoom(roomId)
 
-    // if RoomService cannot find the room, 
+    // if RoomService cannot find the room,
     // return HTTP 404 Not Found.
     if (!room) {
         response.status(404).json({
@@ -156,7 +156,7 @@ app.post("/rooms/:roomId/join", (request, response) => {
     }
 
     //Basic runtime validation:
-    //the client must send a non-empty display name. 
+    //the client must send a non-empty display name.
     if (
         typeof displayName !== "string" ||
         displayName.trim().length === 0 ||
@@ -173,7 +173,7 @@ app.post("/rooms/:roomId/join", (request, response) => {
         displayName.trim()
     );
 
-    // joinRoom() returns undefined when the room does not exist. 
+    // joinRoom() returns undefined when the room does not exist.
     if (!participant) {
         response.status(404).json({
             error: "Room not found",
@@ -194,9 +194,9 @@ app.post("/rooms/:roomId/join", (request, response) => {
 
 
 
-// Express defines how HTTP requests are handled, 
+// Express defines how HTTP requests are handled,
 // but we create the actual Node HTTP server ourselves
-//  so that HTTP and WebSocket traffic can use the same port 
+//  so that HTTP and WebSocket traffic can use the same port
 
 const httpServer = createServer(app);
 
@@ -267,7 +267,7 @@ function broadcastPresence(roomId: string): void {
 }
 
 // This event runs whenever a browser establishes
-// a new WebSocket connection with our backend. 
+// a new WebSocket connection with our backend.
 
 webSocketServer.on("connection", (socket) => {
     console.log("WebSocket client connected");

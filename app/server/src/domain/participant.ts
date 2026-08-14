@@ -3,4 +3,3 @@ export interface Participant{
     displayName: string;
     joinedAt: number;
 }
-

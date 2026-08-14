@@ -265,7 +265,7 @@ function App() {
       setCode(room.editorState.code);
       setLanguage(room.editorState.language);
 
-      //update browser URL without reloading the page. 
+      //update browser URL without reloading the page.
       //This gives us a sharable room link such as:
       // http://localhost:5173/rooms/<room-id>
       window.history.pushState(
@@ -285,13 +285,13 @@ function App() {
     }
   }
 
-  //join the currently loaded room as a participant. 
+  //join the currently loaded room as a participant.
   async function handleJoinRoom() {
     if (!roomId) {
       return;
     }
 
-    // prompt() can later be replaced with proper join form. 
+    // prompt() can later be replaced with proper join form.
     const name = window.prompt("Enter your display name:");
     if (!name || name.trim().length === 0) {
       return;
