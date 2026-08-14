@@ -4,14 +4,14 @@
 
 - `Room` represents one collaborative coding session.
 - `EditorState` contains code, language, and revision.
-- The server will eventually own the canonical editor state.
+- The server owns the canonical editor state.
 - `revision` helps detect stale/concurrent updates.
 
 ## Participant Domain Model
 
 - A Participant represents someone's presence in a room.
 - Participant identity is different from a WebSocket connection.
-- A reconnect can create a new socket without creating a new human participant.
+- In the current simple session model, refreshing or reconnecting means joining again with a new temporary participant.
 
 ## RoomStore
 
@@ -275,3 +275,41 @@ future HTTP/WebSocket handler
 - The sender is excluded from the broadcast because its editor already contains the change.
 - The current implementation sends the whole code document on every change.
 - Simultaneous edits currently behave roughly as last-write-wins; advanced conflict resolution can be added later if needed.
+
+
+## Participant Presence and Disconnect Cleanup
+
+- A successful HTTP join creates the temporary Participant, while `room:join` attaches that participant to a live WebSocket.
+- `socketParticipants` records which participant owns each accepted socket. Participant identity and connection identity are related, but they are not the same value.
+- Presence is based on accepted live sockets, so an HTTP join that never opens a WebSocket is not displayed as online.
+- After a participant connects, the server sends `presence:update` to every open socket in that room.
+- The payload contains simple Participant objects, which is enough to render display names without accounts or profiles.
+- When the socket closes, the server:
+  1. removes the socket from its room's `Set`;
+  2. removes the socket-to-participant association;
+  3. deletes the Participant from `ParticipantStore`;
+  4. removes the participant ID from `Room.participantIds`;
+  5. removes an empty room connection Set; and
+  6. broadcasts the smaller participant list.
+- Refreshing a page counts as leaving. The user must join again. This keeps temporary identity easy to understand and avoids a reconnect-token system.
+- Presence broadcasts use only the target room's Set, so names cannot leak into another room.
+
+
+## Shared Language Selection
+
+- The supported languages are `python`, `javascript`, and `typescript`.
+- A connected client requests a change with `language:update`.
+- Runtime validation checks the value because TypeScript types do not validate data received over a WebSocket.
+- The socket must have joined a room before it may change that room's language.
+- `RoomService.updateLanguage()` updates the canonical `EditorState` and increments its revision.
+- The server broadcasts the accepted value to every socket in that room, including the sender. Waiting for this message keeps the server authoritative.
+- Each browser updates both its selector and Monaco language mode from that one shared value.
+
+
+## Small Input Limits
+
+- Express accepts JSON bodies up to 32 KB.
+- Display names must contain 1-40 characters after trimming.
+- Editor code is capped at 20 KB, measured as UTF-8 bytes rather than JavaScript character count.
+- The WebSocket server rejects payloads above 64 KB before application message handling.
+- These limits are intentionally readable and proportional to a small educational room application.

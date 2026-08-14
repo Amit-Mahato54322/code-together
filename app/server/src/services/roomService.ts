@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import type{
     ProgrammingLanguage,
     Room,
-    EditorState,
-} from "../domain/room.ts"
+} from "../domain/room.js"
 
 import type { Participant } from "../domain/participant.js";
 
@@ -18,13 +17,14 @@ export class RoomService {
   ) {}
 
   createRoom(
-    language: ProgrammingLanguage = "typescript"
+    language: ProgrammingLanguage = "typescript",
+    code = ""
   ): Room {
     const room: Room = {
       id: randomUUID(),
 
       editorState: {
-        code: "",
+        code,
         language,
         revision: 0,
       },
@@ -42,6 +42,18 @@ export class RoomService {
 
   getRoom(roomId: string): Room | undefined {
     return this.roomStore.get(roomId);
+  }
+
+  getParticipants(roomId: string): Participant[] {
+    const room = this.roomStore.get(roomId);
+
+    if (!room) {
+      return [];
+    }
+
+    return room.participantIds
+      .map((participantId) => this.participantStore.get(participantId))
+      .filter((participant): participant is Participant => participant !== undefined);
   }
 
   joinRoom(
@@ -72,5 +84,52 @@ export class RoomService {
     this.roomStore.save(room);
 
     return participant;
+  }
+
+  leaveRoom(roomId: string, participantId: string): boolean {
+    const room = this.roomStore.get(roomId);
+
+    if (!room || !room.participantIds.includes(participantId)) {
+      return false;
+    }
+
+    room.participantIds = room.participantIds.filter(
+      (currentParticipantId) => currentParticipantId !== participantId
+    );
+    this.roomStore.save(room);
+    this.participantStore.delete(participantId);
+
+    return true;
+  }
+
+  updateCode(roomId: string, code: string): Room | undefined {
+    const room = this.roomStore.get(roomId);
+
+    if (!room) {
+      return undefined;
+    }
+
+    room.editorState.code = code;
+    room.editorState.revision += 1;
+    this.roomStore.save(room);
+
+    return room;
+  }
+
+  updateLanguage(
+    roomId: string,
+    language: ProgrammingLanguage
+  ): Room | undefined {
+    const room = this.roomStore.get(roomId);
+
+    if (!room) {
+      return undefined;
+    }
+
+    room.editorState.language = language;
+    room.editorState.revision += 1;
+    this.roomStore.save(room);
+
+    return room;
   }
 }

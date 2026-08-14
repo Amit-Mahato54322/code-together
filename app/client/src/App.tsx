@@ -1,8 +1,14 @@
 import { useEffect, useState, useRef } from "react";
 
-import { createRoom, getRoom, joinRoom } from "./api/rooms";
+import {
+  createRoom,
+  getRoom,
+  joinRoom,
+  type Participant,
+} from "./api/rooms";
 import { CodeEditor } from "./components/CodeEditor";
 import { LanguageSelector } from "./components/LanguageSelector";
+import { ParticipantList } from "./components/ParticipantList";
 
 import {
   LANGUAGE_OPTIONS,
@@ -16,6 +22,25 @@ const DEFAULT_CODE = `function greet(name: string) {
 }
 
 console.log(greet("Code Together"));`;
+
+const WS_URL = import.meta.env.VITE_WS_URL ?? "ws://localhost:3000";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isProgrammingLanguage(value: unknown): value is ProgrammingLanguage {
+  return LANGUAGE_OPTIONS.some((option) => option.id === value);
+}
+
+function isParticipant(value: unknown): value is Participant {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.displayName === "string" &&
+    typeof value.joinedAt === "number"
+  );
+}
 // Read a room ID from a URL shaped like:
 //
 // /rooms/abc123
@@ -51,6 +76,10 @@ function App() {
   // Used only for displaying who joined.
   const [displayName, setDisplayName] =
     useState<string | null>(null);
+
+  // Presence comes from the server so all collaborators render the
+  // same list of currently connected participants.
+  const [participants, setParticipants] = useState<Participant[]>([]);
 
   // Tracks the current Websocket connection state for the UI.
   const [socketStatus, setSocketStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
@@ -105,9 +134,7 @@ function App() {
       return;
     }
 
-    setSocketStatus("connecting");
-
-    const socket = new WebSocket("ws://localhost:3000");
+    const socket = new WebSocket(WS_URL);
 
     // Keep this WebSocket available to other functions
     // inside the component.
@@ -131,7 +158,13 @@ function App() {
     // Runs whenever the backend sends us a WebSocket message.
     socket.onmessage = (event) => {
       try {
-        const message = JSON.parse(event.data);
+        const parsedMessage: unknown = JSON.parse(event.data);
+
+        if (!isRecord(parsedMessage) || typeof parsedMessage.type !== "string") {
+          return;
+        }
+
+        const message = parsedMessage;
 
         console.log(
           "WebSocket message:",
@@ -142,6 +175,17 @@ function App() {
         // is now attached to the room.
         if (message.type === "room:joined") {
           setSocketStatus("connected");
+
+          if (isRecord(message.editorState)) {
+            if (typeof message.editorState.code === "string") {
+              setCode(message.editorState.code);
+            }
+
+            if (isProgrammingLanguage(message.editorState.language)) {
+              setLanguage(message.editorState.language);
+            }
+          }
+
           return;
         }
 
@@ -151,6 +195,23 @@ function App() {
           typeof message.code === "string"
         ) {
           setCode(message.code);
+          return;
+        }
+
+        if (
+          message.type === "language:update" &&
+          isProgrammingLanguage(message.language)
+        ) {
+          setLanguage(message.language);
+          return;
+        }
+
+        if (
+          message.type === "presence:update" &&
+          Array.isArray(message.participants) &&
+          message.participants.every(isParticipant)
+        ) {
+          setParticipants(message.participants);
         }
       } catch (error) {
         console.error(
@@ -164,6 +225,7 @@ function App() {
     socket.onclose = () => {
       console.log("WebSocket disconnected");
       setSocketStatus("disconnected");
+      setParticipants([]);
     };
 
     // Runs if the browser encounters a WebSocket-level error.
@@ -196,10 +258,12 @@ function App() {
       setIsCreatingRoom(true);
 
       // Call POST /rooms on our backend.
-      const room = await createRoom(language);
+      const room = await createRoom(language, code);
 
       // Save the backend-generated room ID in React state.
       setRoomId(room.id);
+      setCode(room.editorState.code);
+      setLanguage(room.editorState.language);
 
       //update browser URL without reloading the page. 
       //This gives us a sharable room link such as:
@@ -238,6 +302,7 @@ function App() {
         roomId,
         name.trim()
       );
+      setSocketStatus("connecting");
       setParticipantId(participant.id);
       setDisplayName(participant.displayName);
     } catch (error) {
@@ -270,6 +335,28 @@ function App() {
     }
   }
 
+  function handleLanguageChange(newLanguage: ProgrammingLanguage) {
+    if (!roomId) {
+      setLanguage(newLanguage);
+      return;
+    }
+
+    const socket = socketRef.current;
+
+    if (
+      socket &&
+      socket.readyState === WebSocket.OPEN &&
+      socketStatus === "connected"
+    ) {
+      socket.send(
+        JSON.stringify({
+          type: "language:update",
+          language: newLanguage,
+        })
+      );
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -288,17 +375,20 @@ function App() {
         <div className="topbar-actions">
           <LanguageSelector
             language={language}
-            onLanguageChange={setLanguage}
+            onLanguageChange={handleLanguageChange}
+            disabled={Boolean(roomId) && socketStatus !== "connected"}
           />
 
-          <button
-            className="create-room-button"
-            type="button"
-            onClick={handleCreateRoom}
-            disabled={isCreatingRoom}
-          >
-            {isCreatingRoom ? "Creating..." : "Create Room"}
-          </button>
+          {!roomId && (
+            <button
+              className="create-room-button"
+              type="button"
+              onClick={handleCreateRoom}
+              disabled={isCreatingRoom}
+            >
+              {isCreatingRoom ? "Creating..." : "Create Room"}
+            </button>
+          )}
 
           {roomId && !participantId && (
             <button
@@ -336,6 +426,8 @@ function App() {
 
             {fileName}
           </button>
+
+          <ParticipantList participants={participants} />
         </aside>
 
         <section className="editor-panel">
@@ -354,6 +446,7 @@ function App() {
               language={language}
               value={code}
               onChange={handleCodeChange}
+              readOnly={Boolean(roomId) && socketStatus !== "connected"}
             />
           </div>
         </section>

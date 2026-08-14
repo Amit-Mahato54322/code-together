@@ -4,6 +4,7 @@ interface CodeEditorProps{
     language: string;
     value: string;
     onChange: (value: string)=> void;
+    readOnly?: boolean;
 }
 
 export function CodeEditor(props:CodeEditorProps){
@@ -23,10 +24,10 @@ export function CodeEditor(props:CodeEditorProps){
                 automaticLayout:true,
                 wordWrap:"on",
                 tabSize:2,
+                readOnly: props.readOnly,
             }
         }
         
         />
     )
 }
-

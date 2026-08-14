@@ -1,14 +1,17 @@
 import express from "express";
 import cors from "cors";
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
+import NodeWebsocket, { WebSocketServer } from "ws";
 import { ParticipantStore } from "./store/participantStore.js";
 import { RoomStore } from "./store/roomStore.js";
 import { RoomService } from "./services/roomService.js";
 //create express application
 const app = express();
 // define a port where backend listens for HTTP requests. 
-const PORT = 3000;
+const PORT = Number(process.env.PORT ?? 3000);
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
+const MAX_DISPLAY_NAME_LENGTH = 40;
+const MAX_SOURCE_CODE_BYTES = 20 * 1024;
 // create our in-memory stores.
 const roomStore = new RoomStore();
 const participantStore = new ParticipantStore();
@@ -19,10 +22,10 @@ const roomService = new RoomService(roomStore, participantStore);
 // we will need need it when clients send data to the server.
 // Allow our react development server to make requests to this backend from the browser. 
 app.use(cors({
-    origin: "http://localhost:5173",
+    origin: CLIENT_ORIGIN,
 }));
 //parse incoming JSON request bodies
-app.use(express.json());
+app.use(express.json({ limit: "32kb" }));
 const SUPPORTED_LANGUAGES = [
     "typescript",
     "javascript",
@@ -34,6 +37,16 @@ const SUPPORTED_LANGUAGES = [
 function isProgrammingLanguage(value) {
     return (typeof value === "string" && SUPPORTED_LANGUAGES.includes(value));
 }
+function isUuid(value) {
+    return (typeof value === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value));
+}
+function isCodeWithinLimit(value) {
+    return Buffer.byteLength(value, "utf8") <= MAX_SOURCE_CODE_BYTES;
+}
+function isRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 // health-check endpoint. 
 // GET/health lets us verify that the server is running.
 app.get("/health", (_request, response) => ( //_ means it's not being used, intentionally 
@@ -42,7 +55,9 @@ response.json({
 })));
 // create a new collaborative room.
 app.post("/rooms", (request, response) => {
-    const language = request.body.language;
+    const body = isRecord(request.body) ? request.body : {};
+    const language = body.language;
+    const code = body.code ?? "";
     //if client sent a language, make sure it is supported. 
     if (language !== undefined && !isProgrammingLanguage(language)) {
         response.status(400).json({
@@ -50,9 +65,15 @@ app.post("/rooms", (request, response) => {
         });
         return;
     }
+    if (typeof code !== "string" || !isCodeWithinLimit(code)) {
+        response.status(400).json({
+            error: "Code must be a string no larger than 20 KB",
+        });
+        return;
+    }
     // if no language was provided, RoomService defaults
     // the new too to Typescript.
-    const room = roomService.createRoom(language);
+    const room = roomService.createRoom(language, code);
     //201 means a new resource was successfully created. 
     response.status(201).json(room);
 });
@@ -62,6 +83,10 @@ app.get("/rooms/:roomId", (request, response) => {
     //e.g., GET/rooms/abc123
     // request.params.roomID === "abc123"
     const roomId = request.params.roomId;
+    if (!isUuid(roomId)) {
+        response.status(400).json({ error: "Invalid room ID" });
+        return;
+    }
     const room = roomService.getRoom(roomId);
     // if RoomService cannot find the room, 
     // return HTTP 404 Not Found.
@@ -76,12 +101,19 @@ app.get("/rooms/:roomId", (request, response) => {
 //Join an existing room as a participant.
 app.post("/rooms/:roomId/join", (request, response) => {
     const roomId = request.params.roomId;
-    const displayName = request.body.displayName;
+    const body = isRecord(request.body) ? request.body : {};
+    const displayName = body.displayName;
+    if (!isUuid(roomId)) {
+        response.status(400).json({ error: "Invalid room ID" });
+        return;
+    }
     //Basic runtime validation:
     //the client must send a non-empty display name. 
-    if (typeof displayName !== "string" || displayName.trim().length === 0) {
+    if (typeof displayName !== "string" ||
+        displayName.trim().length === 0 ||
+        displayName.trim().length > MAX_DISPLAY_NAME_LENGTH) {
         response.status(400).json({
-            error: "Display name is required"
+            error: "Display name must be between 1 and 40 characters"
         });
         return;
     }
@@ -110,12 +142,49 @@ const httpServer = createServer(app);
 // attach a websocket server to the existing HTTP server
 const webSocketServer = new WebSocketServer({
     server: httpServer,
+    maxPayload: 64 * 1024,
 });
 // Each room ID points to the websocket connections that are currently connected to that room.
 //Example:
 // roomConnections.get("room-123")
 // -> Set of browser Websocket connections
 const roomConnections = new Map();
+// The socket itself is a network connection; this Map records which
+// temporary participant owns it after the server accepts room:join.
+const socketParticipants = new Map();
+function sendSocketMessage(socket, message) {
+    if (socket.readyState === NodeWebsocket.OPEN) {
+        socket.send(JSON.stringify(message));
+    }
+}
+function broadcastToRoom(roomId, message, excludedSocket) {
+    const connections = roomConnections.get(roomId);
+    if (!connections) {
+        return;
+    }
+    for (const connection of connections) {
+        if (connection !== excludedSocket) {
+            sendSocketMessage(connection, message);
+        }
+    }
+}
+function broadcastPresence(roomId) {
+    const connections = roomConnections.get(roomId);
+    const connectedParticipantIds = new Set();
+    for (const connection of connections ?? []) {
+        const joinedSocket = socketParticipants.get(connection);
+        if (joinedSocket) {
+            connectedParticipantIds.add(joinedSocket.participantId);
+        }
+    }
+    const participants = roomService
+        .getParticipants(roomId)
+        .filter((participant) => connectedParticipantIds.has(participant.id));
+    broadcastToRoom(roomId, {
+        type: "presence:update",
+        participants,
+    });
+}
 // This event runs whenever a browser establishes
 // a new WebSocket connection with our backend. 
 webSocketServer.on("connection", (socket) => {
@@ -124,87 +193,185 @@ webSocketServer.on("connection", (socket) => {
     // It starts as null because a new WebSocket connection
     // has not identified its room yet.
     let joinedRoomId = null;
-    socket.send(JSON.stringify({
-        type: "connection:ready",
-    }));
+    let joinedParticipantId = null;
+    sendSocketMessage(socket, { type: "connection:ready" });
     // Runs whenever this browser sends a WebSocket message.
     socket.on("message", (rawMessage) => {
         try {
-            // WebSocket messages arrive as raw data,
-            // so convert the message into a string and parse the JSON.
-            const message = JSON.parse(rawMessage.toString());
-            // For now, room:join is the only client message
-            // our WebSocket server understands.
-            if (message.type !== "room:join") {
-                return;
-            }
-            const roomId = message.roomId;
-            const participantId = message.participantId;
-            // Basic runtime validation because WebSocket data
-            // comes from outside our application.
-            if (typeof roomId !== "string" ||
-                typeof participantId !== "string") {
-                socket.send(JSON.stringify({
+            // WebSocket messages arrive as raw data.
+            // Convert the message into a string and then parse the JSON.
+            const parsedMessage = JSON.parse(rawMessage.toString());
+            if (!isRecord(parsedMessage) ||
+                typeof parsedMessage.type !== "string") {
+                sendSocketMessage(socket, {
                     type: "room:error",
-                    error: "Invalid room join message",
-                }));
+                    error: "WebSocket message must include a string type",
+                });
                 return;
             }
-            const room = roomStore.get(roomId);
-            // The room must exist and the participant must already
-            // have joined that room through our HTTP join endpoint.
-            if (!room ||
-                !room.participantIds.includes(participantId)) {
-                socket.send(JSON.stringify({
-                    type: "room:error",
-                    error: "Room or participant not found",
-                }));
+            const message = parsedMessage;
+            // --------------------------------------------------
+            // 1. ROOM JOIN MESSAGE
+            // --------------------------------------------------
+            if (message.type === "room:join") {
+                const roomId = message.roomId;
+                const participantId = message.participantId;
+                if (joinedRoomId) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "This connection already joined a room",
+                    });
+                    return;
+                }
+                // WebSocket messages come from outside our application,
+                // so we must validate the values at runtime.
+                if (!isUuid(roomId) ||
+                    !isUuid(participantId)) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Invalid room join message",
+                    });
+                    return;
+                }
+                const room = roomStore.get(roomId);
+                const participant = participantStore.get(participantId);
+                // The room must exist and the participant must
+                // already belong to that room.
+                if (!room ||
+                    !participant ||
+                    !room.participantIds.includes(participantId)) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Room or participant not found",
+                    });
+                    return;
+                }
+                const existingConnections = roomConnections.get(roomId);
+                const participantAlreadyConnected = [...(existingConnections ?? [])]
+                    .some((connection) => socketParticipants.get(connection)?.participantId === participantId);
+                if (participantAlreadyConnected) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Participant is already connected",
+                    });
+                    return;
+                }
+                if (existingConnections) {
+                    // Other users are already connected to this room.
+                    existingConnections.add(socket);
+                }
+                else {
+                    // This is the first WebSocket connection
+                    // currently connected to this room.
+                    const newConnections = new Set();
+                    newConnections.add(socket);
+                    roomConnections.set(roomId, newConnections);
+                }
+                // Remember which room this particular socket joined.
+                joinedRoomId = roomId;
+                joinedParticipantId = participantId;
+                socketParticipants.set(socket, { roomId, participantId });
+                console.log(`Participant ${participantId} connected to room ${roomId}`);
+                sendSocketMessage(socket, {
+                    type: "room:joined",
+                    roomId,
+                    editorState: room.editorState,
+                });
+                broadcastPresence(roomId);
                 return;
             }
-            // Get the existing WebSocket connections for this room.
-            // If none exist yet, create a new Set.
-            // Check whether this room already has connected WebSocket clients.
-            // Check whether this room already has connected WebSocket clients.
-            const existingConnections = roomConnections.get(roomId);
-            if (existingConnections) {
-                // The room already has users connected.
-                existingConnections.add(socket);
+            // --------------------------------------------------
+            // 2. CODE UPDATE MESSAGE
+            // --------------------------------------------------
+            if (message.type === "code:update") {
+                // A socket must join a room before it can send
+                // code updates to that room.
+                if (!joinedRoomId) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Join a room before editing code",
+                    });
+                    return;
+                }
+                const newCode = message.code;
+                if (typeof newCode !== "string" ||
+                    !isCodeWithinLimit(newCode)) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Code must be a string no larger than 20 KB",
+                    });
+                    return;
+                }
+                const room = roomService.updateCode(joinedRoomId, newCode);
+                if (!room) {
+                    return;
+                }
+                broadcastToRoom(joinedRoomId, {
+                    type: "code:update",
+                    code: room.editorState.code,
+                    revision: room.editorState.revision,
+                }, socket);
+                return;
             }
-            else {
-                // This is the first WebSocket connection for this room.
-                const newConnections = new Set();
-                newConnections.add(socket);
-                roomConnections.set(roomId, newConnections);
+            // --------------------------------------------------
+            // 3. LANGUAGE UPDATE MESSAGE
+            // --------------------------------------------------
+            if (message.type === "language:update") {
+                if (!joinedRoomId) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Join a room before changing language",
+                    });
+                    return;
+                }
+                if (!isProgrammingLanguage(message.language)) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Unsupported programming language",
+                    });
+                    return;
+                }
+                const room = roomService.updateLanguage(joinedRoomId, message.language);
+                if (!room) {
+                    return;
+                }
+                // Include the sender so every browser applies the same
+                // language only after the server accepts it.
+                broadcastToRoom(joinedRoomId, {
+                    type: "language:update",
+                    language: room.editorState.language,
+                    revision: room.editorState.revision,
+                });
+                return;
             }
-            joinedRoomId = roomId;
-            console.log(`Participant ${participantId} connected to room ${roomId}`);
-            // Confirm to the browser that the socket is now
-            // attached to the requested room.
-            socket.send(JSON.stringify({
-                type: "room:joined",
-                roomId,
-            }));
+            sendSocketMessage(socket, {
+                type: "room:error",
+                error: "Unsupported WebSocket message type",
+            });
         }
         catch (error) {
             console.error("Invalid WebSocket message:", error);
-            socket.send(JSON.stringify({
+            sendSocketMessage(socket, {
                 type: "room:error",
                 error: "Invalid WebSocket message",
-            }));
+            });
         }
     });
     socket.on("close", () => {
         console.log("WebSocket client disconnected");
         // If this socket had joined a room,
         // remove it from that room's connection Set.
-        if (joinedRoomId) {
+        if (joinedRoomId && joinedParticipantId) {
             const connections = roomConnections.get(joinedRoomId);
             connections?.delete(socket);
+            socketParticipants.delete(socket);
+            roomService.leaveRoom(joinedRoomId, joinedParticipantId);
             // If nobody is connected to this room anymore,
             // remove the empty Set from the Map.
             if (connections?.size === 0) {
                 roomConnections.delete(joinedRoomId);
             }
+            broadcastPresence(joinedRoomId);
         }
     });
 });

@@ -1,0 +1,12 @@
+# Dependencies and generated builds belong on each developer's machine.
+**/node_modules/
+**/dist/
+
+# Local environment files may contain machine-specific values.
+.env
+.env.*
+!.env.example
+
+# Logs and operating-system files are not project source.
+*.log
+.DS_Store

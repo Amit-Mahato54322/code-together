@@ -77,6 +77,11 @@
   outline-offset: 1px;
 }
 
+.language-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -131,6 +136,43 @@
   color: #4fc1ff;
   font-size: 11px;
   font-weight: 700;
+}
+
+.participants-panel {
+  margin-top: 18px;
+  border-top: 1px solid #2f2f2f;
+}
+
+.participants-empty {
+  margin: 0;
+  padding: 2px 16px;
+  color: #777;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.participant-list {
+  margin: 0;
+  padding: 0 12px;
+  list-style: none;
+}
+
+.participant-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 4px;
+  color: #d2d2d2;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.participant-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4ec9b0;
 }
 
 .editor-panel {

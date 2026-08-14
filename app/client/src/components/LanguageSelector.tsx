@@ -6,11 +6,13 @@ import {
 interface LanguageSelectorProps {
   language: ProgrammingLanguage;
   onLanguageChange: (language: ProgrammingLanguage) => void;
+  disabled?: boolean;
 }
 
 export function LanguageSelector({
   language,
   onLanguageChange,
+  disabled = false,
 }: LanguageSelectorProps) {
   return (
     <label className="language-control">
@@ -19,6 +21,7 @@ export function LanguageSelector({
       <select
         className="language-select"
         value={language}
+        disabled={disabled}
         onChange={(event) =>
           onLanguageChange(
             event.target.value as ProgrammingLanguage

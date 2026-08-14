@@ -22,11 +22,12 @@ export interface Participant{
   joinedAt: number;
 }
 
-const API_URL = "http://localhost:3000";
+const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 // Ask the backend to create a new collaborative room.
 export async function createRoom(
-  language: ProgrammingLanguage
+  language: ProgrammingLanguage,
+  code: string
 ): Promise<Room> {
   const response = await fetch(`${API_URL}/rooms`, {
     method: "POST",
@@ -37,6 +38,7 @@ export async function createRoom(
 
     body: JSON.stringify({
       language,
+      code,
     }),
   });
 
