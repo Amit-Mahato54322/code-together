@@ -2,16 +2,16 @@
 
 Code Together is a browser-based collaborative code editor. A user can write code locally, create a shareable room, join that room under a display name, and collaborate with other connected participants in real time.
 
-The current platform synchronizes source code, the selected language, and participant presence. It does **not** compile or execute code yet. TypeScript, JavaScript, and Python are currently editor modes used for Monaco syntax highlighting and file naming.
+The current frontend is intentionally Python-only: Monaco always uses Python mode, rooms created by this client are marked as Python, and no language selector is shown. The platform synchronizes source code and participant presence, but it does **not** compile or execute code yet.
 
 ## Current capabilities
 
-- Monaco-based editor with TypeScript, JavaScript, and Python modes
+- Monaco-based Python editor with a `main.py` workspace
 - Room creation with a shareable `/rooms/:roomId` URL
+- One-click copying of the full room URL
 - Room loading through the HTTP API
 - Temporary participant identities scoped to a room session
 - Real-time source-code synchronization over WebSockets
-- Real-time language synchronization
 - Live participant presence and disconnect updates
 - Server-authoritative editor state with monotonically increasing revisions
 - Runtime validation for HTTP requests and WebSocket messages
@@ -22,9 +22,9 @@ The current platform synchronizes source code, the selected language, and partic
 | Layer | Technology | Responsibility |
 | --- | --- | --- |
 | Web client | React, TypeScript, Vite | Workspace UI, local editor state, room controls, and network clients |
-| Editor | Monaco Editor through `@monaco-editor/react` | Editing experience and language-aware syntax highlighting |
+| Editor | Monaco Editor through `@monaco-editor/react` | Python editing experience and syntax highlighting |
 | HTTP API | Express | Health checks, room creation/loading, and participant creation |
-| Real-time transport | `ws` WebSocket server | Room attachment, editor updates, language changes, and presence |
+| Real-time transport | `ws` WebSocket server | Room attachment, editor updates, and presence |
 | Application runtime | Node.js | Hosts Express and WebSockets on one HTTP server |
 | Storage | In-memory `Map` instances | Stores rooms and participants for the lifetime of the server process |
 
@@ -38,9 +38,10 @@ code-together/
 │   │   │   ├── api/rooms.ts              # HTTP room client and shared response shapes
 │   │   │   ├── components/
 │   │   │   │   ├── CodeEditor.tsx        # Monaco adapter
-│   │   │   │   ├── LanguageSelector.tsx  # Language control
+│   │   │   │   ├── CopyRoomLinkButton.tsx # Share-link interaction and feedback
 │   │   │   │   └── ParticipantList.tsx   # Presence UI
-│   │   │   ├── config/languages.ts       # Supported editor languages
+│   │   │   ├── config/editor.ts          # Central Python editor configuration
+│   │   │   ├── services/clipboard.ts      # Browser clipboard adapter
 │   │   │   ├── App.tsx                   # Client state and orchestration
 │   │   │   └── App.css                   # Workspace styling
 │   │   └── package.json
@@ -61,7 +62,7 @@ code-together/
 The platform uses one browser client and one Node.js server. The server exposes two communication paths on the same port:
 
 1. **HTTP is the control plane.** It creates rooms, retrieves room state, and issues participant identities.
-2. **WebSockets are the collaboration plane.** They attach an issued participant to a live room and carry code, language, and presence events.
+2. **WebSockets are the collaboration plane.** They attach an issued participant to a live room and carry code and presence events used by the current frontend.
 
 ```mermaid
 flowchart LR
@@ -92,7 +93,7 @@ flowchart LR
 
 `App.tsx` is currently the client-side orchestration boundary. It owns:
 
-- the current source code and selected language;
+- the current source code;
 - the loaded room ID;
 - the temporary participant ID and display name;
 - the participant presence list;
@@ -102,9 +103,11 @@ flowchart LR
 The smaller UI components are intentionally presentation-focused:
 
 - `CodeEditor` adapts Monaco's `onChange` callback and read-only setting.
-- `LanguageSelector` renders the supported language options.
+- `CopyRoomLinkButton` owns clipboard interaction status and user feedback.
 - `ParticipantList` renders the server-provided presence list.
 - `api/rooms.ts` isolates HTTP calls from the UI.
+
+Python editor metadata lives in `config/editor.ts`. Both Monaco configuration and room creation depend on that single immutable value, preventing scattered language literals without introducing a language-selection abstraction the UI does not need.
 
 The client performs runtime checks on incoming WebSocket messages before applying them. These checks prevent malformed data from being treated as trusted application state, although they are not a substitute for authentication or a shared schema package.
 
@@ -149,7 +152,7 @@ interface Room {
 }
 ```
 
-`editorState` is the server's canonical representation of a room's document. `revision` starts at `0` and increments for every accepted code or language update.
+`editorState` is the server's canonical representation of a room's document. `revision` starts at `0` and increments for every accepted code or language update. The backend retains its general language field for compatibility and possible future expansion, while the current frontend always presents the document as Python.
 
 ### Participant
 
@@ -180,7 +183,7 @@ sequenceDiagram
     participant R as RoomStore
 
     U->>C: Click Create Room
-    C->>H: POST /rooms { language, code }
+    C->>H: POST /rooms { language: "python", code }
     H->>H: Validate language and code size
     H->>S: createRoom(language, code)
     S->>R: Save room with revision 0
@@ -200,8 +203,8 @@ When the application loads a URL matching `/rooms/:roomId`:
 1. The client extracts the room ID from `window.location.pathname`.
 2. It requests `GET /rooms/:roomId`.
 3. The server validates the UUID and reads the room from `RoomStore`.
-4. The client replaces its local code and language with the returned canonical state.
-5. The room editor and language selector remain read-only until the user joins and the WebSocket attachment succeeds.
+4. The client replaces its local code with the returned canonical state.
+5. The room editor remains read-only until the user joins and the WebSocket attachment succeeds.
 
 Production hosting must route unknown client paths such as `/rooms/:roomId` back to the Vite application's `index.html`; otherwise a direct browser refresh can return a hosting-layer 404 before React loads.
 
@@ -269,11 +272,11 @@ sequenceDiagram
 
 The server excludes the sender from the code broadcast because the sender has already applied the edit locally.
 
-### 5. Language synchronization
+### 5. Python-only frontend policy
 
-In a room, language changes are not applied optimistically. The client sends `language:update`, the server validates and stores it, increments the revision, and broadcasts the accepted language to **all** sockets, including the sender. This ensures the sender changes modes only after server acceptance.
+The frontend does not maintain language state, render a language selector, send `language:update`, or apply incoming language changes. `config/editor.ts` fixes Monaco to Python mode and supplies the `PY`, `main.py`, and `Python` labels. Room creation sends the same centralized `"python"` value explicitly.
 
-The language currently controls syntax highlighting, the Monaco language mode, and the displayed filename extension. It does not choose a compiler runtime yet.
+The backend intentionally retains its broader `ProgrammingLanguage` type, language validation, room field, and `language:update` protocol. This keeps existing server contracts compatible and makes future language reintroduction possible without a backend rewrite. An older room with different language metadata still loads in the current client, but its code is displayed in Python mode.
 
 ### 6. Presence and disconnects
 
@@ -307,7 +310,7 @@ The default API base URL is `http://localhost:3000`.
 ```bash
 curl -X POST http://localhost:3000/rooms \
   -H 'Content-Type: application/json' \
-  -d '{"language":"typescript","code":"const answer = 42;"}'
+  -d '{"language":"python","code":"answer = 42"}'
 ```
 
 ### Example: join a room
@@ -328,7 +331,7 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | --- | --- | --- |
 | `room:join` | `{ roomId, participantId }` | IDs must be valid, related UUIDs issued through HTTP |
 | `code:update` | `{ code }` | Socket must have joined; code must be at most 20 KiB |
-| `language:update` | `{ language }` | Socket must have joined; language must be supported |
+| `language:update` | `{ language }` | Backend compatibility capability; the Python-only frontend does not send it |
 
 ### Server-to-client messages
 
@@ -337,7 +340,7 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | `connection:ready` | No additional fields | Transport connection is open; room is not joined yet |
 | `room:joined` | `{ roomId, editorState }` | Room attachment succeeded and canonical state is supplied |
 | `code:update` | `{ code, revision }` | Another participant changed the document |
-| `language:update` | `{ language, revision }` | The canonical language changed |
+| `language:update` | `{ language, revision }` | Backend compatibility event; the Python-only frontend ignores it |
 | `presence:update` | `{ participants }` | Complete list of currently connected participants |
 | `room:error` | `{ error }` | The server rejected or could not parse a message |
 
@@ -357,7 +360,8 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 
 | Limit | Current value |
 | --- | --- |
-| Supported languages | TypeScript, JavaScript, Python |
+| Frontend editor language | Python |
+| Backend language metadata | TypeScript, JavaScript, Python retained for compatibility |
 | Source code | 20 KiB UTF-8 per room/update |
 | Express JSON body | 32 KiB |
 | WebSocket payload | 64 KiB |
@@ -404,9 +408,9 @@ Vite serves the client at `http://localhost:5173` by default.
 
 1. Open `http://localhost:5173`.
 2. Edit the starter source if desired.
-3. Select a language and create a room.
+3. Create a Python room.
 4. Join with a display name.
-5. Copy the `/rooms/:roomId` URL into another browser window.
+5. Use **Copy Room Link** and open the copied URL in another browser window.
 6. Join as a second participant and edit from either window.
 
 ## Configuration
@@ -467,7 +471,7 @@ The client currently has no automated test command. The server's placeholder `np
 - The UI uses browser prompts and alerts for join and error flows.
 - The client and server duplicate protocol/domain types rather than importing a shared schema.
 - Rooms are not expired or garbage-collected.
-- Code is edited and synchronized but not compiled or executed.
+- The frontend supports Python editing only; code is synchronized but not compiled or executed.
 
 ## Future compiler and execution architecture
 

@@ -12,14 +12,13 @@
 ## Props and Focused Components
 
 - Props are values and callbacks passed from a parent component to a child component.
-- `CodeEditor` receives code, language, read-only state, and an edit callback.
-- `LanguageSelector` receives the accepted language and a change callback.
+- `CodeEditor` receives code, read-only state, and an edit callback. It reads the fixed Python mode from the central editor configuration.
 - `ParticipantList` receives the current server-provided participant array.
 - `App` coordinates shared room behavior, while these components focus on rendering one part of the interface.
 
 ## React State
 
-- `useState` is used for values that must update the UI: code, language, room ID, participant identity, connection status, and presence.
+- `useState` is used for values that must update the UI: code, room ID, participant identity, connection status, and presence.
 - A room ID identifies the shared workspace. A participant ID identifies this temporary browser session.
 - The display name is presentation data, while the participant ID is what the server validates during `room:join`.
 - Keeping UI data in state means React automatically renders the current status after an HTTP response or WebSocket message.
@@ -42,10 +41,17 @@
 
 ## Server-Authoritative Room State
 
-- `room:joined` includes the latest server code and language. This prevents a stale room-loading response from becoming the active editor state.
+- `room:joined` includes the latest server code. Applying it prevents a stale room-loading response from becoming the active editor state.
 - Local editor changes use `code:update`; accepted remote changes come back through the same message type.
-- A language selection sends `language:update`, but the UI applies room changes only when the server broadcasts the accepted language.
-- The selector and editor are read-only/disabled between loading a room and completing its join, avoiding unsynchronized local edits.
+- The editor is read-only between loading a room and completing its join, avoiding unsynchronized local edits.
+
+## Python-Only Frontend
+
+- `config/editor.ts` is the single source of truth for the Python Monaco mode, `main.py` filename, badge, and label.
+- The frontend has no language state or selector and does not send or handle `language:update` messages.
+- Room creation explicitly sends the centralized `"python"` value to the existing API.
+- The backend keeps its general language type and protocol for compatibility and future extension.
+- Additional languages can be restored later by expanding the editor configuration and reintroducing a selector and language state; the server contract does not need to be redesigned.
 
 ## Presence Updates
 

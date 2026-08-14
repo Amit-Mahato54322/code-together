@@ -7,30 +7,21 @@ import {
   type Participant,
 } from "./api/rooms";
 import { CodeEditor } from "./components/CodeEditor";
-import { LanguageSelector } from "./components/LanguageSelector";
+import { CopyRoomLinkButton } from "./components/CopyRoomLinkButton";
 import { ParticipantList } from "./components/ParticipantList";
-
-import {
-  LANGUAGE_OPTIONS,
-  type ProgrammingLanguage,
-} from "./config/languages";
+import { PYTHON_EDITOR } from "./config/editor";
 
 import "./App.css";
 
-const DEFAULT_CODE = `function greet(name: string) {
-  return "Hello, " + name + "!";
-}
+const DEFAULT_CODE = `def greet(name: str) -> str:
+    return f"Hello, {name}!"
 
-console.log(greet("Code Together"));`;
+print(greet("Code Together"))`;
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? "ws://localhost:3000";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isProgrammingLanguage(value: unknown): value is ProgrammingLanguage {
-  return LANGUAGE_OPTIONS.some((option) => option.id === value);
 }
 
 function isParticipant(value: unknown): value is Participant {
@@ -41,15 +32,14 @@ function isParticipant(value: unknown): value is Participant {
     typeof value.joinedAt === "number"
   );
 }
+
 // Read a room ID from a URL shaped like:
 //
 // /rooms/abc123
 //
 // If the current URL is not a room URL, return null.
 function getRoomIdFromUrl(): string | null {
-  const match = window.location.pathname.match(
-    /^\/rooms\/([^/]+)$/
-  );
+  const match = window.location.pathname.match(/^\/rooms\/([^/]+)$/);
 
   return match ? match[1] : null;
 }
@@ -57,10 +47,6 @@ function getRoomIdFromUrl(): string | null {
 function App() {
   // The code currently displayed inside Monaco.
   const [code, setCode] = useState(DEFAULT_CODE);
-
-  // The programming language currently selected by the user.
-  const [language, setLanguage] =
-    useState<ProgrammingLanguage>("typescript");
 
   // Stores the ID returned by the backend after a room is created.
   // null means that this browser has not created a room yet.
@@ -81,15 +67,15 @@ function App() {
   // same list of currently connected participants.
   const [participants, setParticipants] = useState<Participant[]>([]);
 
-  // Tracks the current Websocket connection state for the UI.
-  const [socketStatus, setSocketStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+  // Tracks the current WebSocket connection state for the UI.
+  const [socketStatus, setSocketStatus] = useState<
+    "disconnected" | "connecting" | "connected"
+  >("disconnected");
 
   // A ref lets us keep the WebSocket object between renders
   // without causing a re-render whenever the socket changes.
   const socketRef = useRef<WebSocket | null>(null);
 
-  //when the application first loads, check whether the URL already contains a room ID.
-  //This lets someone open a shared /rooms/:roomId link directly.
   // When the application first loads, check whether the URL
   // already contains a room ID.
   //
@@ -112,7 +98,6 @@ function App() {
 
         setRoomId(room.id);
         setCode(room.editorState.code);
-        setLanguage(room.editorState.language);
       } catch (error) {
         console.error("Could not load room:", error);
 
@@ -180,10 +165,6 @@ function App() {
             if (typeof message.editorState.code === "string") {
               setCode(message.editorState.code);
             }
-
-            if (isProgrammingLanguage(message.editorState.language)) {
-              setLanguage(message.editorState.language);
-            }
           }
 
           return;
@@ -195,14 +176,6 @@ function App() {
           typeof message.code === "string"
         ) {
           setCode(message.code);
-          return;
-        }
-
-        if (
-          message.type === "language:update" &&
-          isProgrammingLanguage(message.language)
-        ) {
-          setLanguage(message.language);
           return;
         }
 
@@ -244,11 +217,10 @@ function App() {
     };
   }, [roomId, participantId]);
 
-  const activeLanguage =
-    LANGUAGE_OPTIONS.find((option) => option.id === language) ??
-    LANGUAGE_OPTIONS[0];
-
-  const fileName = `main.${activeLanguage.extension}`;
+  const roomUrl = roomId
+    ? new URL(`/rooms/${encodeURIComponent(roomId)}`, window.location.origin)
+      .toString()
+    : null;
 
   // This function runs when the user clicks "Create Room".
   async function handleCreateRoom() {
@@ -258,15 +230,14 @@ function App() {
       setIsCreatingRoom(true);
 
       // Call POST /rooms on our backend.
-      const room = await createRoom(language, code);
+      const room = await createRoom(code);
 
       // Save the backend-generated room ID in React state.
       setRoomId(room.id);
       setCode(room.editorState.code);
-      setLanguage(room.editorState.language);
 
-      //update browser URL without reloading the page.
-      //This gives us a sharable room link such as:
+      // Update the browser URL without reloading the page.
+      // This gives us a shareable room link such as:
       // http://localhost:5173/rooms/<room-id>
       window.history.pushState(
         {},
@@ -285,23 +256,20 @@ function App() {
     }
   }
 
-  //join the currently loaded room as a participant.
+  // Join the currently loaded room as a participant.
   async function handleJoinRoom() {
     if (!roomId) {
       return;
     }
 
-    // prompt() can later be replaced with proper join form.
+    // prompt() can later be replaced with a proper join form.
     const name = window.prompt("Enter your display name:");
     if (!name || name.trim().length === 0) {
       return;
     }
 
     try {
-      const participant = await joinRoom(
-        roomId,
-        name.trim()
-      );
+      const participant = await joinRoom(roomId, name.trim());
       setSocketStatus("connecting");
       setParticipantId(participant.id);
       setDisplayName(participant.displayName);
@@ -310,7 +278,6 @@ function App() {
       alert("Could not join this room.");
     }
   }
-
 
   // Runs every time the local user changes the Monaco editor.
   function handleCodeChange(newCode: string) {
@@ -335,28 +302,6 @@ function App() {
     }
   }
 
-  function handleLanguageChange(newLanguage: ProgrammingLanguage) {
-    if (!roomId) {
-      setLanguage(newLanguage);
-      return;
-    }
-
-    const socket = socketRef.current;
-
-    if (
-      socket &&
-      socket.readyState === WebSocket.OPEN &&
-      socketStatus === "connected"
-    ) {
-      socket.send(
-        JSON.stringify({
-          type: "language:update",
-          language: newLanguage,
-        })
-      );
-    }
-  }
-
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -373,15 +318,9 @@ function App() {
         </div>
 
         <div className="topbar-actions">
-          <LanguageSelector
-            language={language}
-            onLanguageChange={handleLanguageChange}
-            disabled={Boolean(roomId) && socketStatus !== "connected"}
-          />
-
           {!roomId && (
             <button
-              className="create-room-button"
+              className="topbar-button"
               type="button"
               onClick={handleCreateRoom}
               disabled={isCreatingRoom}
@@ -390,9 +329,11 @@ function App() {
             </button>
           )}
 
+          {roomUrl && <CopyRoomLinkButton roomUrl={roomUrl} />}
+
           {roomId && !participantId && (
             <button
-              className="create-room-button"
+              className="topbar-button"
               type="button"
               onClick={handleJoinRoom}
             >
@@ -421,10 +362,10 @@ function App() {
             type="button"
           >
             <span className="file-badge">
-              {activeLanguage.badge}
+              {PYTHON_EDITOR.badge}
             </span>
 
-            {fileName}
+            {PYTHON_EDITOR.fileName}
           </button>
 
           <ParticipantList participants={participants} />
@@ -434,16 +375,15 @@ function App() {
           <div className="editor-tabs">
             <div className="editor-tab editor-tab-active">
               <span className="file-badge">
-                {activeLanguage.badge}
+                {PYTHON_EDITOR.badge}
               </span>
 
-              {fileName}
+              {PYTHON_EDITOR.fileName}
             </div>
           </div>
 
           <div className="editor-container">
             <CodeEditor
-              language={language}
               value={code}
               onChange={handleCodeChange}
               readOnly={Boolean(roomId) && socketStatus !== "connected"}
@@ -457,7 +397,7 @@ function App() {
           {roomId ? `Room: ${roomId}` : "Local workspace"}
         </span>
 
-        <span>{activeLanguage.label}</span>
+        <span>{PYTHON_EDITOR.label}</span>
       </footer>
     </div>
   );
