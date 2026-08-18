@@ -4,6 +4,8 @@ Code Together is a browser-based collaborative code editor. A user can write cod
 
 The current frontend is intentionally Python-only: Monaco always uses Python mode, rooms created by this client are marked as Python, and no language selector is shown. The platform synchronizes source code and participant presence, but it does **not** compile or execute code yet.
 
+Room persistence is complete: PostgreSQL is the source of truth for room documents. A room's URL, latest code, language, revision, and timestamps survive a complete backend restart. Live participants and WebSocket connections intentionally do not survive because they represent active network sessions rather than durable room data.
+
 ## Current capabilities
 
 - Monaco-based Python editor with a `main.py` workspace
@@ -120,7 +122,7 @@ The client performs runtime checks on incoming WebSocket messages before applyin
 
 ### Server architecture
 
-The server is divided into four responsibilities:
+The server is divided into five responsibilities:
 
 - **Transport:** Express routes and the WebSocket event handler parse external input and return protocol-level responses.
 - **Validation:** Route and socket helpers validate UUIDs, supported languages, display names, and code sizes.
@@ -151,6 +153,25 @@ HTTP routes and WebSocket handlers
 `database.ts` configures one shared `pg.Pool`. `PostgresRoomRepository` owns SQL and maps snake_case rows through `mapRoomRow`. `RoomService` contains application rules and depends only on the `RoomRepository` interface. `index.ts` is the composition root that selects the PostgreSQL implementation.
 
 Row Level Security remains enabled and no broad anonymous policy is created. The configured direct PostgreSQL role has sufficient server-side privileges to access the table. Browser users cannot query `public.rooms` directly through this application, and `DATABASE_URL` is never sent to React.
+
+### Persisted database schema
+
+The version-controlled migration is [`supabase/migrations/20260818000000_create_rooms_table.sql`](supabase/migrations/20260818000000_create_rooms_table.sql). It records the same schema used by the Supabase project:
+
+```sql
+create table if not exists public.rooms (
+  id uuid primary key,
+  code text not null default '',
+  language varchar(32) not null default 'python',
+  revision integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.rooms enable row level security;
+```
+
+The React application does not use the Supabase browser client to access this table. The Node.js backend connects through `DATABASE_URL`, and all SQL is isolated inside `PostgresRoomRepository`. Queries use PostgreSQL parameters such as `$1` instead of inserting user-provided code into SQL strings.
 
 WebSocket objects cannot be stored meaningfully in PostgreSQL: they are live network handles tied to one process and one connection lifetime. Only room document state is durable. Participant records, socket ownership, and connection sets remain in memory and are rebuilt as users join after a restart.
 
@@ -423,6 +444,26 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 - `DATABASE_URL` in `app/server/.env`
 - Two terminal sessions
 
+### Configure PostgreSQL
+
+1. Open the Supabase SQL Editor and run the contents of `supabase/migrations/20260818000000_create_rooms_table.sql`. If the table already exists, the migration is safe to keep as the source-controlled record of that schema.
+2. Copy the server environment template:
+
+   ```bash
+   cd app/server
+   cp .env.example .env
+   ```
+
+3. Put the Supabase PostgreSQL connection string in `app/server/.env`:
+
+   ```dotenv
+   DATABASE_URL=postgresql://YOUR_DATABASE_USER:YOUR_DATABASE_PASSWORD@YOUR_DATABASE_HOST:5432/postgres
+   PORT=3000
+   CLIENT_ORIGIN=http://localhost:5173
+   ```
+
+Do not commit `.env`, expose `DATABASE_URL` to React, or rename it with a `VITE_` prefix. The backend creates one shared connection pool and keeps it open for the server lifetime.
+
 ### Install dependencies
 
 ```bash
@@ -523,10 +564,22 @@ npm run build
 
 cd ../server
 npm run build
+npm test
 npm start
 ```
 
 The client currently has no automated test command. The backend uses Node's built-in test runner; `npm test` builds TypeScript and runs focused mapper, repository, service, presence, parameterization, and stale-revision tests without an additional test dependency.
+
+The automated repository test uses a controlled pool substitute and does not require a live Supabase connection. The full restart-recovery check remains an integration test and requires the configured database plus the manual steps above.
+
+### Expected persistence behavior
+
+- Creating a room inserts exactly one `public.rooms` row at revision `0`.
+- Loading a valid room URL reads its canonical state from PostgreSQL; an unknown room preserves the API's `404` response.
+- An accepted WebSocket edit updates `code`, increments `revision`, and advances `updated_at` before it is broadcast.
+- A stale revision cannot overwrite newer code because the repository update includes the expected previous revision in its `where` clause.
+- A database failure is logged by the backend and produces a safe client error; the server does not broadcast an update that failed to persist.
+- Quotes, apostrophes, newlines, Unicode, backslashes, and SQL-looking source text are stored as ordinary code because queries are parameterized.
 
 ## Current limitations
 
@@ -592,6 +645,14 @@ Before or alongside compiler work, the platform would benefit from:
 - patch-based or CRDT synchronization for conflict-safe editing;
 - observability for connection counts, room counts, message failures, and latency;
 - a deployment configuration with TLS termination and WebSocket upgrade support.
+
+## Where SOLID principles are applied
+
+- **Single Responsibility Principle:** `config/database.ts` configures the shared PostgreSQL pool; `PostgresRoomRepository` owns SQL and row mapping; `RoomService` owns room rules; the Express and WebSocket handlers translate transport messages; and `ParticipantStore` owns process-local presence.
+- **Open/Closed Principle:** `RoomService` accepts any implementation of `RoomRepository`. Adding another storage adapter does not require rewriting room business logic.
+- **Liskov Substitution Principle:** `RoomStore` and `PostgresRoomRepository` implement the same asynchronous repository behavior, so service callers do not branch on the storage technology.
+- **Interface Segregation Principle:** `RoomRepository` includes only the operations the application uses: create a room, find one room, and update its editor state.
+- **Dependency Inversion Principle:** `RoomService` imports the `RoomRepository` contract rather than `pg`, `Pool`, or Supabase-specific code. The concrete PostgreSQL adapter is selected in `src/index.ts`, the server composition root.
 
 ## Design summary
 
