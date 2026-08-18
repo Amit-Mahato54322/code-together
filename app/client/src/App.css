@@ -149,7 +149,7 @@
 
 .editor-panel {
   display: grid;
-  grid-template-rows: 36px minmax(0, 1fr);
+  grid-template-rows: 36px minmax(0, 1fr) minmax(140px, 24vh);
   min-width: 0;
   min-height: 0;
   background: #1e1e1e;
@@ -221,4 +221,70 @@
 
 .copy-room-link-button {
   min-width: 116px;
+}
+
+.run-button {
+  border-color: #238636;
+  background: #238636;
+}
+
+.run-button:hover:not(:disabled) {
+  background: #2ea043;
+}
+
+.output-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid #2f2f2f;
+  background: #181818;
+}
+
+.output-header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid #2f2f2f;
+  background: #181818;
+  color: #b8b8b8;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.execution-status {
+  text-transform: uppercase;
+}
+
+.execution-status-running {
+  color: #dcdcaa;
+}
+
+.execution-status-success {
+  color: #4ec9b0;
+}
+
+.execution-status-error,
+.execution-status-timeout,
+.execution-notice {
+  color: #f48771;
+}
+
+.execution-notice {
+  margin: 10px 14px 0;
+  font-size: 12px;
+}
+
+.execution-output {
+  margin: 0;
+  padding: 12px 14px;
+  color: #d4d4d4;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

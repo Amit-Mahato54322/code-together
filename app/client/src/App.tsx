@@ -8,8 +8,15 @@ import {
 } from "./api/rooms";
 import { CodeEditor } from "./components/CodeEditor";
 import { CopyRoomLinkButton } from "./components/CopyRoomLinkButton";
+import { OutputPanel } from "./components/OutputPanel";
 import { ParticipantList } from "./components/ParticipantList";
 import { PYTHON_EDITOR } from "./config/editor";
+import type {
+  ExecutionResult,
+  ExecutionResultStatus,
+  ExecutionRunMessage,
+  ExecutionStatus,
+} from "./types/execution";
 
 import "./App.css";
 
@@ -38,6 +45,33 @@ function isRevision(value: unknown): value is number {
     typeof value === "number" &&
     Number.isSafeInteger(value) &&
     value >= 0
+  );
+}
+
+function isExecutionResultStatus(
+  value: unknown
+): value is ExecutionResultStatus {
+  return value === "success" || value === "error" || value === "timeout";
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isExecutionResult(value: unknown): value is ExecutionResult {
+  return (
+    isRecord(value) &&
+    isExecutionResultStatus(value.status) &&
+    typeof value.stdout === "string" &&
+    typeof value.stderr === "string" &&
+    isNullableString(value.errorName) &&
+    isNullableString(value.traceback) &&
+    typeof value.executionTimeMs === "number" &&
+    Number.isFinite(value.executionTimeMs) &&
+    value.executionTimeMs >= 0 &&
+    typeof value.requestedBy === "string" &&
+    typeof value.startedAt === "string" &&
+    typeof value.completedAt === "string"
   );
 }
 
@@ -74,6 +108,19 @@ function App() {
   // Presence comes from the server so all collaborators render the
   // same list of currently connected participants.
   const [participants, setParticipants] = useState<Participant[]>([]);
+
+  // Execution is synchronized through server broadcasts, just like code and
+  // presence. Every connected participant receives the same result object.
+  const [executionStatus, setExecutionStatus] =
+    useState<ExecutionStatus>("idle");
+  const [executionResult, setExecutionResult] =
+    useState<ExecutionResult | null>(null);
+  const [executionNotice, setExecutionNotice] =
+    useState<string | null>(null);
+
+  // Running is disabled until PostgreSQL acknowledges this browser's latest
+  // edit, ensuring execution uses the code currently visible in Monaco.
+  const [isCodeSyncPending, setIsCodeSyncPending] = useState(false);
 
   // Tracks the current WebSocket connection state for the UI.
   const [socketStatus, setSocketStatus] = useState<
@@ -210,6 +257,7 @@ function App() {
               revisionRef.current = message.editorState.revision;
               updateInFlightRef.current = false;
               pendingCodeRef.current = null;
+              setIsCodeSyncPending(false);
             }
           }
 
@@ -231,10 +279,49 @@ function App() {
           if (message.participantId === participantId) {
             updateInFlightRef.current = false;
             sendPendingCodeUpdate();
+
+            if (
+              !updateInFlightRef.current &&
+              pendingCodeRef.current === null
+            ) {
+              setIsCodeSyncPending(false);
+            }
           } else {
             setCode(message.code);
           }
 
+          return;
+        }
+
+        if (
+          message.type === "execution:started" &&
+          message.roomId === roomId &&
+          typeof message.requestedBy === "string" &&
+          typeof message.startedAt === "string"
+        ) {
+          setExecutionStatus("running");
+          setExecutionResult(null);
+          setExecutionNotice(null);
+          return;
+        }
+
+        if (
+          message.type === "execution:result" &&
+          message.roomId === roomId &&
+          isExecutionResult(message.result)
+        ) {
+          setExecutionStatus(message.result.status);
+          setExecutionResult(message.result);
+          setExecutionNotice(null);
+          return;
+        }
+
+        if (
+          message.type === "execution:rejected" &&
+          message.roomId === roomId &&
+          typeof message.error === "string"
+        ) {
+          setExecutionNotice(message.error);
           return;
         }
 
@@ -255,6 +342,7 @@ function App() {
 
           updateInFlightRef.current = false;
           pendingCodeRef.current = null;
+          setIsCodeSyncPending(false);
           return;
         }
 
@@ -278,8 +366,12 @@ function App() {
       console.log("WebSocket disconnected");
       setSocketStatus("disconnected");
       setParticipants([]);
+      setExecutionStatus((currentStatus) =>
+        currentStatus === "running" ? "idle" : currentStatus
+      );
       updateInFlightRef.current = false;
       pendingCodeRef.current = null;
+      setIsCodeSyncPending(false);
     };
 
     // Runs if the browser encounters a WebSocket-level error.
@@ -375,9 +467,35 @@ function App() {
       socket.readyState === WebSocket.OPEN &&
       socketStatus === "connected"
     ) {
+      setIsCodeSyncPending(true);
       pendingCodeRef.current = newCode;
       sendPendingCodeUpdate();
     }
+  }
+
+  function handleRunCode(): void {
+    const socket = socketRef.current;
+
+    if (
+      !roomId ||
+      !participantId ||
+      socketStatus !== "connected" ||
+      isCodeSyncPending ||
+      executionStatus === "running" ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    const message: ExecutionRunMessage = {
+      type: "execution:run",
+      roomId,
+      participantId,
+    };
+
+    setExecutionNotice(null);
+    socket.send(JSON.stringify(message));
   }
 
   return (
@@ -416,6 +534,21 @@ function App() {
               onClick={handleJoinRoom}
             >
               Join Room
+            </button>
+          )}
+
+          {roomId && participantId && (
+            <button
+              className="topbar-button run-button"
+              type="button"
+              onClick={handleRunCode}
+              disabled={
+                socketStatus !== "connected" ||
+                isCodeSyncPending ||
+                executionStatus === "running"
+              }
+            >
+              {executionStatus === "running" ? "Running..." : "Run"}
             </button>
           )}
 
@@ -467,6 +600,12 @@ function App() {
               readOnly={Boolean(roomId) && socketStatus !== "connected"}
             />
           </div>
+
+          <OutputPanel
+            status={executionStatus}
+            result={executionResult}
+            notice={executionNotice}
+          />
         </section>
       </main>
 

@@ -2,7 +2,7 @@
 
 Code Together is a browser-based collaborative code editor. A user can write code locally, create a shareable room, join that room under a display name, and collaborate with other connected participants in real time.
 
-The current frontend is intentionally Python-only: Monaco always uses Python mode, rooms created by this client are marked as Python, and no language selector is shown. The platform synchronizes source code and participant presence, but it does **not** compile or execute code yet.
+The current application is intentionally Python-only: Monaco always uses Python mode, rooms created by this client are marked as Python, and no language selector is shown. Joined participants can run the latest synchronized room code in a short-lived E2B cloud sandbox, and every participant in that room receives the same execution state and output.
 
 Room persistence is complete: PostgreSQL is the source of truth for room documents. A room's URL, latest code, language, revision, and timestamps survive a complete backend restart. Live participants and WebSocket connections intentionally do not survive because they represent active network sessions rather than durable room data.
 
@@ -17,6 +17,9 @@ Room persistence is complete: PostgreSQL is the source of truth for room documen
 - Live participant presence and disconnect updates
 - Server-authoritative editor state with monotonically increasing revisions
 - PostgreSQL room persistence through Supabase, including restart recovery
+- Remote Python execution in isolated E2B sandboxes
+- Room-wide synchronized running, success, error, and timeout states
+- One execution at a time per room with bounded source and output sizes
 - Runtime validation for HTTP requests and WebSocket messages
 - Configurable client API/WebSocket URLs and server origin/port
 
@@ -27,10 +30,11 @@ Room persistence is complete: PostgreSQL is the source of truth for room documen
 | Web client | React, TypeScript, Vite | Workspace UI, local editor state, room controls, and network clients |
 | Editor | Monaco Editor through `@monaco-editor/react` | Python editing experience and syntax highlighting |
 | HTTP API | Express | Health checks, room creation/loading, and participant creation |
-| Real-time transport | `ws` WebSocket server | Room attachment, editor updates, and presence |
+| Real-time transport | `ws` WebSocket server | Room attachment, editor updates, presence, and execution broadcasts |
 | Application runtime | Node.js | Hosts Express and WebSockets on one HTTP server |
 | Persistent storage | Supabase PostgreSQL through `pg` | Stores room code, language, revision, and timestamps across backend restarts |
 | Ephemeral storage | In-memory `Map` instances | Stores participant presence and live WebSocket ownership for the current process |
+| Remote execution | E2B Code Interpreter | Runs Python outside the Node.js process in a short-lived cloud sandbox |
 
 ## Repository layout
 
@@ -43,6 +47,7 @@ code-together/
 │   │   │   ├── components/
 │   │   │   │   ├── CodeEditor.tsx        # Monaco adapter
 │   │   │   │   ├── CopyRoomLinkButton.tsx # Share-link interaction and feedback
+│   │   │   │   ├── OutputPanel.tsx        # Execution status and whitespace-preserving output
 │   │   │   │   └── ParticipantList.tsx   # Presence UI
 │   │   │   ├── config/editor.ts          # Central Python editor configuration
 │   │   │   ├── services/clipboard.ts      # Browser clipboard adapter
@@ -52,7 +57,8 @@ code-together/
 │   └── server/
 │       ├── src/
 │       │   ├── domain/                    # Room and participant types
-│       │   ├── config/database.ts         # Shared PostgreSQL connection pool
+│       │   ├── config/                     # PostgreSQL pool and E2B key validation
+│       │   ├── execution/                  # Executor contract, E2B adapter, mock, and limits
 │       │   ├── repositories/              # Room contract, row mapper, and PostgreSQL adapter
 │       │   ├── services/roomService.ts    # Room business operations
 │       │   ├── store/                     # Ephemeral presence and in-memory test adapter
@@ -81,6 +87,8 @@ flowchart LR
     Service[RoomService]
     Repository[RoomRepository]
     Rooms[(Supabase PostgreSQL)]
+    Executor[CodeExecutor]
+    E2B[E2B Python sandbox]
     Participants[(ParticipantStore)]
     Connections[(Room connection maps)]
 
@@ -94,6 +102,8 @@ flowchart LR
     WS --> Service
     Service --> Repository
     Repository --> Rooms
+    WS --> Executor
+    Executor --> E2B
     Service --> Participants
     WS --> Connections
 ```
@@ -122,15 +132,20 @@ The client performs runtime checks on incoming WebSocket messages before applyin
 
 ### Server architecture
 
-The server is divided into five responsibilities:
+The server is divided into six responsibilities:
 
 - **Transport:** Express routes and the WebSocket event handler parse external input and return protocol-level responses.
 - **Validation:** Route and socket helpers validate UUIDs, supported languages, display names, and code sizes.
 - **Business logic:** `RoomService` creates rooms and participants and updates room state.
 - **Persistent storage:** `PostgresRoomRepository` owns parameterized SQL and row mapping.
 - **Presence storage:** `ParticipantStore` owns temporary participant-to-room membership.
+- **Remote execution:** `E2BPythonExecutor` creates, uses, normalizes, and closes E2B sandboxes behind the `CodeExecutor` interface.
 
 Express and the WebSocket server share a single Node HTTP server. This keeps deployment simple and allows HTTP and WebSocket traffic to use the same port, while retaining distinct protocols and handlers.
+
+### Why E2B
+
+[E2B Code Interpreter](https://e2b.dev/docs) provides short-lived, isolated cloud sandboxes through a small TypeScript SDK. It keeps untrusted Python away from the host filesystem and the main Node.js process while returning structured stdout, stderr, and Python error information. A fresh sandbox per run is easier to reason about than persistent execution sessions and prevents one room's runtime state from leaking into another.
 
 ### Why Supabase PostgreSQL
 
@@ -177,7 +192,7 @@ WebSocket objects cannot be stored meaningfully in PostgreSQL: they are live net
 
 ### Server-side state
 
-The server combines one durable collection with three process-local collections:
+The server combines one durable collection with four process-local collections:
 
 | Collection | Key | Value | Purpose |
 | --- | --- | --- | --- |
@@ -185,6 +200,7 @@ The server combines one durable collection with three process-local collections:
 | `ParticipantStore` | Participant UUID | Participant and room ID | Temporary participant profile and membership |
 | `roomConnections` | Room UUID | Set of WebSocket connections | Live sockets currently attached to each room |
 | `socketParticipants` | WebSocket connection | Room and participant IDs | Ownership of each authenticated room connection |
+| `runningRoomIds` | Room UUID | Set membership | Prevents simultaneous execution in one room |
 
 Restarting the server removes participants and connections, but PostgreSQL preserves every room and its latest editor revision. A recovered room correctly begins with zero connected participants.
 
@@ -219,6 +235,24 @@ interface Participant {
 ```
 
 Participant IDs are temporary UUIDs. There are no user accounts, passwords, cookies, or durable sessions in the current architecture.
+
+### Execution result
+
+```ts
+interface ExecutionResult {
+  status: "success" | "error" | "timeout";
+  stdout: string;
+  stderr: string;
+  errorName: string | null;
+  traceback: string | null;
+  executionTimeMs: number;
+  requestedBy: string;
+  startedAt: string;
+  completedAt: string;
+}
+```
+
+Execution results are normalized application data, not E2B SDK objects. They are broadcast through WebSockets and kept only in frontend memory; no execution-history table is created.
 
 ## End-to-end data flow
 
@@ -359,6 +393,46 @@ Rooms themselves are not deleted when empty. They remain in PostgreSQL across ba
 
 If the HTTP join succeeds but the WebSocket never attaches, that participant record is not displayed in presence. It currently remains in memory because disconnect cleanup only runs for an attached socket.
 
+### 7. Remote Python execution
+
+This feature is called Python execution rather than a compiler because Python source is run by a Python interpreter inside E2B. The Node.js backend never evaluates or starts a local Python process.
+
+1. A joined participant clicks **Run** in `App.tsx`.
+2. `handleRunCode` sends `execution:run` with room and participant IDs, but no source code.
+3. The backend verifies that the socket owns those IDs and that the participant still belongs to the room.
+4. `RoomService.getRoom()` loads the authoritative code from PostgreSQL.
+5. `runningRoomIds` rejects a second run in the same room; no queue or second sandbox is created.
+6. The backend broadcasts `execution:started`, so every Run button becomes disabled.
+7. `E2BPythonExecutor` creates a fresh E2B sandbox and calls `runCode` in Python mode.
+8. Stdout, stderr, Python errors, and timeouts are converted into one `ExecutionResult`.
+9. The sandbox is killed and the room lock is removed in `finally` blocks.
+10. The backend broadcasts `execution:result`, and every `OutputPanel` renders the same whitespace-preserving output.
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant W as WebSocket server
+    participant S as RoomService
+    participant DB as PostgreSQL
+    participant E as CodeExecutor
+    participant B as Client B
+
+    A->>W: execution:run { roomId, participantId }
+    W->>W: Validate socket ownership and room lock
+    W->>S: getRoom(roomId)
+    S->>DB: SELECT authoritative room
+    DB-->>S: Latest code and revision
+    W-->>A: execution:started
+    W-->>B: execution:started
+    W->>E: execute(latestCode)
+    E->>E: Create sandbox, run Python, normalize, kill
+    E-->>W: ExecutionOutcome
+    W-->>A: execution:result
+    W-->>B: execution:result
+```
+
+The client disables Run while its latest edit awaits a PostgreSQL acknowledgement. The server also processes messages from each socket sequentially. Together these rules ensure a Run request cannot overtake that participant's preceding code update.
+
 ## HTTP API
 
 The default API base URL is `http://localhost:3000`.
@@ -396,6 +470,7 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | --- | --- | --- |
 | `room:join` | `{ roomId, participantId }` | IDs must be valid, related UUIDs issued through HTTP |
 | `code:update` | `{ code, revision? }` | Socket must have joined; code must be at most 20 KiB; current clients send the expected revision |
+| `execution:run` | `{ roomId, participantId }` | Socket must own both IDs; source code is deliberately omitted |
 | `language:update` | `{ language, revision? }` | Backend compatibility capability; the Python-only frontend does not send it |
 
 ### Server-to-client messages
@@ -405,6 +480,9 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | `connection:ready` | No additional fields | Transport connection is open; room is not joined yet |
 | `room:joined` | `{ roomId, editorState }` | Room attachment succeeded and canonical state is supplied |
 | `code:update` | `{ code, revision, participantId }` | Persisted editor update or sender acknowledgement |
+| `execution:started` | `{ roomId, requestedBy, startedAt }` | One room execution was accepted and all Run buttons should disable |
+| `execution:result` | `{ roomId, result }` | Normalized success, Python error, timeout, or safe infrastructure failure |
+| `execution:rejected` | `{ roomId, error }` | This request could not start, commonly because the room is already running |
 | `language:update` | `{ language, revision }` | Backend compatibility event; the Python-only frontend ignores it |
 | `presence:update` | `{ participants }` | Complete list of currently connected participants |
 | `room:error` | `{ error, editorState? }` | The server rejected a message; stale updates include canonical state for resynchronization |
@@ -417,6 +495,9 @@ The current synchronization model sends the entire document and protects each wr
 - Each accepted code or language update increments one shared room revision.
 - WebSockets preserve message order per connection.
 - The client sends its expected revision and queues one in-flight update.
+- Run remains disabled until this client's latest code revision is acknowledged.
+- WebSocket messages from one connection are processed sequentially, including asynchronous database work.
+- A room-level lock allows one sandbox at a time and is always released in `finally`.
 - A stale revision is rejected and cannot overwrite the newer database state.
 - There is no operational transformation, CRDT, text patching, cursor sharing, or selection sharing.
 
@@ -429,6 +510,9 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 | Frontend editor language | Python |
 | Backend language metadata | TypeScript, JavaScript, Python retained for compatibility |
 | Source code | 20 KiB UTF-8 per room/update |
+| Execution timeout | 10 seconds |
+| Combined stdout, stderr, and traceback | 50,000 characters, followed by `[Output truncated]` when exceeded |
+| Concurrent execution | One active run per room and backend process |
 | Express JSON body | 32 KiB |
 | WebSocket payload | 64 KiB |
 | Display name | 1–40 trimmed characters |
@@ -442,9 +526,10 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 - Node.js and npm
 - A Supabase project with the `public.rooms` migration applied
 - `DATABASE_URL` in `app/server/.env`
+- An E2B API key in `app/server/.env`
 - Two terminal sessions
 
-### Configure PostgreSQL
+### Configure backend services
 
 1. Open the Supabase SQL Editor and run the contents of `supabase/migrations/20260818000000_create_rooms_table.sql`. If the table already exists, the migration is safe to keep as the source-controlled record of that schema.
 2. Copy the server environment template:
@@ -458,11 +543,12 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 
    ```dotenv
    DATABASE_URL=postgresql://YOUR_DATABASE_USER:YOUR_DATABASE_PASSWORD@YOUR_DATABASE_HOST:5432/postgres
+   E2B_API_KEY=e2b_YOUR_API_KEY
    PORT=3000
    CLIENT_ORIGIN=http://localhost:5173
    ```
 
-Do not commit `.env`, expose `DATABASE_URL` to React, or rename it with a `VITE_` prefix. The backend creates one shared connection pool and keeps it open for the server lifetime.
+Do not commit `.env`, expose either secret to React, or rename either secret with a `VITE_` prefix. The backend creates one shared database pool and creates a fresh short-lived E2B sandbox only for an accepted run.
 
 ### Install dependencies
 
@@ -523,18 +609,19 @@ npm run build
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | Required | Supabase PostgreSQL connection string used only by the backend |
+| `E2B_API_KEY` | Required for Run | E2B server credential; validated when execution is requested |
 | `PORT` | `3000` | Shared HTTP and WebSocket port |
 | `CLIENT_ORIGIN` | `http://localhost:5173` | Browser origin accepted by CORS |
 
 Example:
 
 ```bash
-DATABASE_URL=postgresql://... PORT=8080 CLIENT_ORIGIN=https://app.example.com npm start
+DATABASE_URL=postgresql://... E2B_API_KEY=e2b_... PORT=8080 CLIENT_ORIGIN=https://app.example.com npm start
 ```
 
 For a production HTTPS client, use `https://` for `VITE_API_URL` and `wss://` for `VITE_WS_URL` to avoid mixed-content browser failures.
 
-`DATABASE_URL` must never use a `VITE_` prefix or be exposed to the React client. Copy `app/server/.env.example` to `.env` for local development; `.env` is ignored by Git.
+`DATABASE_URL` and `E2B_API_KEY` must never use a `VITE_` prefix or be exposed to the React client. Copy `app/server/.env.example` to `.env` for local development; `.env` is ignored by Git.
 
 ### Test backend restart recovery
 
@@ -555,6 +642,19 @@ from public.rooms
 order by updated_at desc;
 ```
 
+### Test synchronized Python execution
+
+1. Add `E2B_API_KEY` to `app/server/.env`, then start the backend and frontend.
+2. Create a room, join it in two browser tabs, and confirm code synchronization is settled.
+3. Run `print("Hello from Code Together")` followed by `print(6 * 7)` and confirm both tabs show the same two output lines.
+4. Run `print("Hello"` and confirm both tabs show a readable `SyntaxError` and Run becomes enabled again.
+5. Run `value = 10 / 0` and confirm both tabs show `ZeroDivisionError`.
+6. Run `while True: pass` and confirm both tabs show a timeout after approximately 10 seconds, then run valid code again.
+7. Print 100,000 lines and confirm output ends with `[Output truncated]` while the backend remains responsive.
+8. Click Run nearly simultaneously in both tabs and confirm only one run starts while the other request is rejected.
+
+Temporarily setting `E2B_API_KEY=` is a safe configuration test. The backend should log `Missing required environment variable: E2B_API_KEY`, clients should receive only `Unable to run the code right now.`, and a second Run should prove the room was unlocked.
+
 ## Build and verification
 
 ```bash
@@ -568,7 +668,7 @@ npm test
 npm start
 ```
 
-The client currently has no automated test command. The backend uses Node's built-in test runner; `npm test` builds TypeScript and runs focused mapper, repository, service, presence, parameterization, and stale-revision tests without an additional test dependency.
+The client currently has no automated test command. The backend uses Node's built-in test runner; `npm test` builds TypeScript and runs focused room persistence, mock executor, E2B result mapping, configuration validation, output limiting, parameterization, and stale-revision tests without an additional test dependency.
 
 The automated repository test uses a controlled pool substitute and does not require a live Supabase connection. The full restart-recovery check remains an integration test and requires the configured database plus the manual steps above.
 
@@ -593,48 +693,27 @@ The automated repository test uses a controlled pool substitute and does not req
 - The UI uses browser prompts and alerts for join and error flows.
 - The client and server duplicate protocol/domain types rather than importing a shared schema.
 - Rooms are not expired or garbage-collected.
-- The frontend supports Python editing only; code is synchronized but not compiled or executed.
+- Execution results are not persisted; a newly joined or reloaded client does not recover earlier output.
+- Room locks are process-local, so a horizontally scaled deployment would require coordinated locking before multiple backend instances could execute the same room safely.
+- There is no cancellation, interactive stdin, package installation UI, file upload, streaming output, or execution history.
+- E2B startup and network latency are included in `executionTimeMs`; it is elapsed request time rather than Python CPU time.
+- The frontend and executor support Python only.
 
-## Future compiler and execution architecture
+## Execution security decisions
 
-Compilation and code execution should be added as a separate subsystem rather than running untrusted user programs inside the collaboration API process.
-
-A safe high-level design is:
-
-```mermaid
-flowchart LR
-    Client[React client]
-    API[Collaboration API]
-    Queue[(Execution queue)]
-    Worker[Isolated execution worker]
-    Sandbox[Ephemeral sandbox]
-    Results[(Short-lived result store)]
-
-    Client -- run request --> API
-    API -- validated job --> Queue
-    Queue --> Worker
-    Worker --> Sandbox
-    Sandbox -- stdout/stderr/status --> Worker
-    Worker --> Results
-    API -- result or status stream --> Client
-```
-
-Recommended compiler milestones:
-
-1. Define an execution request/response contract with language, source, stdin, status, stdout, stderr, exit code, and timing.
-2. Start with one language and a local development-only execution adapter.
-3. Move execution into an isolated worker with strict CPU, memory, process, filesystem, output, and wall-clock limits.
-4. Add a queue so execution cannot block HTTP or WebSocket collaboration traffic.
-5. Stream status and output back through a dedicated protocol rather than mixing execution state into editor revisions.
-6. Add cancellation, per-user/per-room rate limits, audit logs, and retention limits.
-7. Add compiler/runtime image versioning so results remain reproducible.
-8. Expand the language registry so editor metadata and execution capability are related but remain distinct.
-
-Before accepting public execution traffic, the platform will need sandboxing that prevents network access, host filesystem access, process escape, fork bombs, excessive output, and resource exhaustion. A timeout alone is not a sufficient security boundary.
+- Python never runs through Node.js `exec`, `eval`, `spawn`, or a local interpreter.
+- Each accepted request creates a new E2B Code Interpreter sandbox and kills it in `finally`.
+- Sandbox internet access is disabled for this feature.
+- The backend loads code from PostgreSQL; the execution request cannot inject a different source string.
+- Source is limited to 20 KiB and combined textual output is limited to 50,000 characters.
+- Code execution is limited to 10 seconds.
+- Only a socket attached to the matching room and participant may request execution.
+- Provider failures are logged on the server, while clients receive a generic message without credentials or provider response objects.
+- `E2B_API_KEY` exists only in the backend `.env` file and is never sent to React.
 
 ## Suggested next architecture improvements
 
-Before or alongside compiler work, the platform would benefit from:
+The platform would next benefit from:
 
 - automated unit tests for `RoomService` and validation helpers;
 - HTTP and WebSocket integration tests;
@@ -644,16 +723,17 @@ Before or alongside compiler work, the platform would benefit from:
 - structured error payloads with stable error codes;
 - patch-based or CRDT synchronization for conflict-safe editing;
 - observability for connection counts, room counts, message failures, and latency;
+- per-participant execution rate limiting before a public deployment;
 - a deployment configuration with TLS termination and WebSocket upgrade support.
 
 ## Where SOLID principles are applied
 
-- **Single Responsibility Principle:** `config/database.ts` configures the shared PostgreSQL pool; `PostgresRoomRepository` owns SQL and row mapping; `RoomService` owns room rules; the Express and WebSocket handlers translate transport messages; and `ParticipantStore` owns process-local presence.
-- **Open/Closed Principle:** `RoomService` accepts any implementation of `RoomRepository`. Adding another storage adapter does not require rewriting room business logic.
-- **Liskov Substitution Principle:** `RoomStore` and `PostgresRoomRepository` implement the same asynchronous repository behavior, so service callers do not branch on the storage technology.
-- **Interface Segregation Principle:** `RoomRepository` includes only the operations the application uses: create a room, find one room, and update its editor state.
-- **Dependency Inversion Principle:** `RoomService` imports the `RoomRepository` contract rather than `pg`, `Pool`, or Supabase-specific code. The concrete PostgreSQL adapter is selected in `src/index.ts`, the server composition root.
+- **Single Responsibility Principle:** `config/database.ts` configures PostgreSQL; `config/e2b.ts` validates the E2B credential; `PostgresRoomRepository` owns SQL; `RoomService` owns room rules; the WebSocket handler coordinates execution; `E2BPythonExecutor.execute` owns the sandbox lifecycle and provider mapping; `OutputPanel` only renders execution state; and `ParticipantStore` owns presence.
+- **Open/Closed Principle:** `RoomService` accepts any `RoomRepository`, and the execution workflow accepts any `CodeExecutor`. Replacing E2B requires one new executor implementation and one composition-root change rather than a WebSocket rewrite.
+- **Liskov Substitution Principle:** `RoomStore` and `PostgresRoomRepository` obey the same repository contract. `MockPythonExecutor` and `E2BPythonExecutor` both return the same provider-independent `ExecutionOutcome`, so callers do not branch on the implementation.
+- **Interface Segregation Principle:** `RoomRepository` contains only current room operations, while `CodeExecutor` contains only `execute(code)`. It does not expose shells, files, package installation, or other unused E2B capabilities.
+- **Dependency Inversion Principle:** `RoomService` depends on `RoomRepository`, and the WebSocket workflow depends on `CodeExecutor`, not `pg.Pool` or E2B response types. `src/index.ts` is the composition root that selects `PostgresRoomRepository` and `E2BPythonExecutor`.
 
 ## Design summary
 
-Code Together treats PostgreSQL as the source of truth for room state and React as a responsive projection of that state. HTTP establishes resources and temporary identities; WebSockets attach live sessions and distribute only successfully persisted changes. This separation keeps the MVP understandable while leaving clear boundaries for stronger collaboration algorithms, authentication, expiration, and a future isolated compiler service.
+Code Together treats PostgreSQL as the source of truth for room code and React as a responsive projection of synchronized server state. HTTP establishes resources and temporary identities; WebSockets attach live sessions, distribute persisted edits, and synchronize execution state. E2B runs Python outside the collaboration server behind one small executor interface. The design stays interview-friendly because each request follows one visible path without queues, factories, extra databases, or frontend state libraries.

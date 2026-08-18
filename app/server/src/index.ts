@@ -4,7 +4,18 @@ import { createServer } from "node:http";
 import NodeWebsocket, { WebSocketServer, type RawData } from "ws";
 
 import { databasePool } from "./config/database.js";
+import { getE2BApiKey } from "./config/e2b.js";
+import type {
+    ExecutionOutcome,
+    ExecutionRejectedMessage,
+    ExecutionResult,
+    ExecutionResultMessage,
+    ExecutionStartedMessage,
+} from "./domain/execution.js";
 import type { ProgrammingLanguage } from "./domain/room.js";
+import type { CodeExecutor } from "./execution/codeExecutor.js";
+import { E2BPythonExecutor } from "./execution/e2bPythonExecutor.js";
+import { MAX_SOURCE_CODE_BYTES } from "./execution/executionLimits.js";
 import { PostgresRoomRepository } from "./repositories/postgresRoomRepository.js";
 import { ParticipantStore } from "./store/participantStore.js";
 import { RoomService } from "./services/roomService.js";
@@ -17,7 +28,6 @@ const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
 const MAX_DISPLAY_NAME_LENGTH = 40;
-const MAX_SOURCE_CODE_BYTES = 20 * 1024;
 
 // PostgreSQL owns persistent room state. ParticipantStore owns only temporary
 // presence data for sockets connected to this backend process.
@@ -30,6 +40,10 @@ const roomService = new RoomService(
     roomRepository,
     participantStore
 );
+
+// The concrete remote provider is selected only in this composition root.
+// WebSocket orchestration depends on the small CodeExecutor contract.
+const codeExecutor: CodeExecutor = new E2BPythonExecutor(getE2BApiKey);
 
 
 
@@ -260,10 +274,28 @@ const socketParticipants = new Map<
     { roomId: string; participantId: string }
 >();
 
+// Execution coordination is intentionally process-local. A room can run one
+// program at a time, and every entry is removed in a finally block.
+const runningRoomIds = new Set<string>();
+
 function sendSocketMessage(socket: NodeWebsocket, message: object): void {
     if (socket.readyState === NodeWebsocket.OPEN) {
         socket.send(JSON.stringify(message));
     }
+}
+
+function sendExecutionRejection(
+    socket: NodeWebsocket,
+    roomId: string,
+    error: string
+): void {
+    const message: ExecutionRejectedMessage = {
+        type: "execution:rejected",
+        roomId,
+        error,
+    };
+
+    sendSocketMessage(socket, message);
 }
 
 function broadcastToRoom(
@@ -317,6 +349,7 @@ webSocketServer.on("connection", (socket) => {
     // has not identified its room yet.
     let joinedRoomId: string | null = null;
     let joinedParticipantId: string | null = null;
+    let messageQueue: Promise<void> = Promise.resolve();
 
     sendSocketMessage(socket, { type: "connection:ready" });
 
@@ -524,7 +557,136 @@ webSocketServer.on("connection", (socket) => {
             }
 
             // --------------------------------------------------
-            // 3. LANGUAGE UPDATE MESSAGE
+            // 3. PYTHON EXECUTION MESSAGE
+            // --------------------------------------------------
+            if (message.type === "execution:run") {
+                const roomId = message.roomId;
+                const participantId = message.participantId;
+
+                if (!isUuid(roomId) || !isUuid(participantId)) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Invalid execution request",
+                    });
+                    return;
+                }
+
+                if (
+                    joinedRoomId !== roomId ||
+                    joinedParticipantId !== participantId
+                ) {
+                    sendExecutionRejection(
+                        socket,
+                        roomId,
+                        "Join this room before running code"
+                    );
+                    return;
+                }
+
+                const participant = roomService.getParticipantForRoom(
+                    roomId,
+                    participantId
+                );
+
+                if (!participant) {
+                    sendExecutionRejection(
+                        socket,
+                        roomId,
+                        "Participant is not connected to this room"
+                    );
+                    return;
+                }
+
+                if (runningRoomIds.has(roomId)) {
+                    sendExecutionRejection(
+                        socket,
+                        roomId,
+                        "This room is already running code"
+                    );
+                    return;
+                }
+
+                // Add the lock before the database lookup. Two requests that
+                // arrive together cannot both pass this point.
+                runningRoomIds.add(roomId);
+
+                try {
+                    const room = await roomService.getRoom(roomId);
+
+                    if (!room) {
+                        sendExecutionRejection(socket, roomId, "Room not found");
+                        return;
+                    }
+
+                    if (room.editorState.language !== "python") {
+                        sendExecutionRejection(
+                            socket,
+                            roomId,
+                            "Only Python rooms can be executed"
+                        );
+                        return;
+                    }
+
+                    if (!isCodeWithinLimit(room.editorState.code)) {
+                        sendExecutionRejection(
+                            socket,
+                            roomId,
+                            "Python code must be no larger than 20 KB"
+                        );
+                        return;
+                    }
+
+                    const startedAt = new Date().toISOString();
+                    const executionStartedAtMs = Date.now();
+                    const startedMessage: ExecutionStartedMessage = {
+                        type: "execution:started",
+                        roomId,
+                        requestedBy: participantId,
+                        startedAt,
+                    };
+
+                    broadcastToRoom(roomId, startedMessage);
+
+                    let outcome: ExecutionOutcome;
+
+                    try {
+                        outcome = await codeExecutor.execute(
+                            room.editorState.code
+                        );
+                    } catch (error: unknown) {
+                        logServerError("Python execution provider failed:", error);
+                        outcome = {
+                            status: "error",
+                            stdout: "",
+                            stderr: "Unable to run the code right now.",
+                            errorName: "ExecutionServiceError",
+                            traceback: null,
+                            executionTimeMs: Date.now() - executionStartedAtMs,
+                        };
+                    }
+
+                    const result: ExecutionResult = {
+                        ...outcome,
+                        requestedBy: participantId,
+                        startedAt,
+                        completedAt: new Date().toISOString(),
+                    };
+                    const resultMessage: ExecutionResultMessage = {
+                        type: "execution:result",
+                        roomId,
+                        result,
+                    };
+
+                    broadcastToRoom(roomId, resultMessage);
+                } finally {
+                    runningRoomIds.delete(roomId);
+                }
+
+                return;
+            }
+
+            // --------------------------------------------------
+            // 4. LANGUAGE UPDATE MESSAGE
             // --------------------------------------------------
             if (message.type === "language:update") {
                 if (!joinedRoomId) {
@@ -594,17 +756,18 @@ webSocketServer.on("connection", (socket) => {
             });
     }
 
-    // EventEmitter does not await asynchronous listeners. Attaching catch()
-    // here prevents database or application failures from becoming unhandled
-    // promise rejections.
+    // EventEmitter does not await asynchronous listeners. A per-socket promise
+    // chain both preserves message order and prevents unhandled rejections.
     socket.on("message", (rawMessage) => {
-        void handleSocketMessage(rawMessage).catch((error: unknown) => {
-            logServerError("Could not process WebSocket message:", error);
-            sendSocketMessage(socket, {
-                type: "room:error",
-                error: "Could not process room message",
+        messageQueue = messageQueue
+            .then(() => handleSocketMessage(rawMessage))
+            .catch((error: unknown) => {
+                logServerError("Could not process WebSocket message:", error);
+                sendSocketMessage(socket, {
+                    type: "room:error",
+                    error: "Could not process room message",
+                });
             });
-        });
     });
 
     socket.on("close", () => {
