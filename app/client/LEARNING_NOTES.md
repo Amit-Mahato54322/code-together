@@ -5,9 +5,9 @@
 - `App` stores the current code in React `useState`.
 - The code is passed to `CodeEditor` through its `value` prop, so Monaco is a controlled editor.
 - Monaco calls the `onChange` prop when the local user types.
-- The local state updates immediately, and a connected room also sends the complete document in `code:update`.
+- The local state updates immediately, and a connected room sends the complete document plus its expected revision in `code:update`.
 - A remote `code:update` changes the same React state, so Monaco renders the collaborator's latest document.
-- Whole-document updates are easy to trace and appropriate for a room of roughly 3-4 people. Simultaneous conflicting edits are currently last-write-wins.
+- Whole-document updates are easy to trace and appropriate for a small room. PostgreSQL rejects a stale expected revision instead of overwriting newer state.
 
 ## Props and Focused Components
 
@@ -37,12 +37,15 @@
 - The WebSocket object needs to survive React renders so button and editor handlers can send messages through it.
 - Changing the socket object itself does not need to redraw the interface.
 - `useRef` stores that long-lived mutable object without causing a render.
+- Additional refs hold the last accepted revision, whether an update is in flight, and the newest queued code.
 - Connection status does affect the interface, so it belongs in `useState` instead.
 
 ## Server-Authoritative Room State
 
 - `room:joined` includes the latest server code. Applying it prevents a stale room-loading response from becoming the active editor state.
-- Local editor changes use `code:update`; accepted remote changes come back through the same message type.
+- Local editor changes use `code:update`; accepted changes come back through the same message type as either a sender acknowledgement or a remote update.
+- Only one code update is in flight. If the user keeps typing, the newest complete document waits in `pendingCodeRef` until the acknowledgement advances `revisionRef`.
+- A stale-update `room:error` can include canonical `editorState`, allowing the client to resynchronize code and revision.
 - The editor is read-only between loading a room and completing its join, avoiding unsynchronized local edits.
 
 ## Python-Only Frontend

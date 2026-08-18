@@ -14,6 +14,7 @@ The current frontend is intentionally Python-only: Monaco always uses Python mod
 - Real-time source-code synchronization over WebSockets
 - Live participant presence and disconnect updates
 - Server-authoritative editor state with monotonically increasing revisions
+- PostgreSQL room persistence through Supabase, including restart recovery
 - Runtime validation for HTTP requests and WebSocket messages
 - Configurable client API/WebSocket URLs and server origin/port
 
@@ -26,7 +27,8 @@ The current frontend is intentionally Python-only: Monaco always uses Python mod
 | HTTP API | Express | Health checks, room creation/loading, and participant creation |
 | Real-time transport | `ws` WebSocket server | Room attachment, editor updates, and presence |
 | Application runtime | Node.js | Hosts Express and WebSockets on one HTTP server |
-| Storage | In-memory `Map` instances | Stores rooms and participants for the lifetime of the server process |
+| Persistent storage | Supabase PostgreSQL through `pg` | Stores room code, language, revision, and timestamps across backend restarts |
+| Ephemeral storage | In-memory `Map` instances | Stores participant presence and live WebSocket ownership for the current process |
 
 ## Repository layout
 
@@ -48,11 +50,14 @@ code-together/
 │   └── server/
 │       ├── src/
 │       │   ├── domain/                    # Room and participant types
+│       │   ├── config/database.ts         # Shared PostgreSQL connection pool
+│       │   ├── repositories/              # Room contract, row mapper, and PostgreSQL adapter
 │       │   ├── services/roomService.ts    # Room business operations
-│       │   ├── store/                     # In-memory persistence adapters
+│       │   ├── store/                     # Ephemeral presence and in-memory test adapter
 │       │   └── index.ts                   # HTTP routes and WebSocket protocol
 │       ├── package.json
 │       └── tsconfig.json
+├── supabase/migrations/                   # Version-controlled database schema
 ├── .gitignore
 └── README.md
 ```
@@ -72,7 +77,8 @@ flowchart LR
     HTTP[Express HTTP API]
     WS[WebSocket server]
     Service[RoomService]
-    Rooms[(RoomStore)]
+    Repository[RoomRepository]
+    Rooms[(Supabase PostgreSQL)]
     Participants[(ParticipantStore)]
     Connections[(Room connection maps)]
 
@@ -84,7 +90,8 @@ flowchart LR
     Browser -- live JSON messages --> WS
     HTTP --> Service
     WS --> Service
-    Service --> Rooms
+    Service --> Repository
+    Repository --> Rooms
     Service --> Participants
     WS --> Connections
 ```
@@ -118,22 +125,47 @@ The server is divided into four responsibilities:
 - **Transport:** Express routes and the WebSocket event handler parse external input and return protocol-level responses.
 - **Validation:** Route and socket helpers validate UUIDs, supported languages, display names, and code sizes.
 - **Business logic:** `RoomService` creates rooms and participants and updates room state.
-- **Storage:** `RoomStore` and `ParticipantStore` wrap in-memory maps.
+- **Persistent storage:** `PostgresRoomRepository` owns parameterized SQL and row mapping.
+- **Presence storage:** `ParticipantStore` owns temporary participant-to-room membership.
 
 Express and the WebSocket server share a single Node HTTP server. This keeps deployment simple and allows HTTP and WebSocket traffic to use the same port, while retaining distinct protocols and handlers.
 
+### Why Supabase PostgreSQL
+
+Supabase provides a managed PostgreSQL database while allowing the backend to use the standard `pg` driver and ordinary SQL. This project does not use the Supabase browser SDK for room persistence. Keeping database access behind the Node server preserves the existing HTTP/WebSocket validation boundary and avoids sending database credentials to the frontend.
+
+The persistence dependency path is deliberately small:
+
+```text
+HTTP routes and WebSocket handlers
+                ↓
+            RoomService
+                ↓
+          RoomRepository
+                ↓
+    PostgresRoomRepository
+                ↓
+       Supabase PostgreSQL
+```
+
+`database.ts` configures one shared `pg.Pool`. `PostgresRoomRepository` owns SQL and maps snake_case rows through `mapRoomRow`. `RoomService` contains application rules and depends only on the `RoomRepository` interface. `index.ts` is the composition root that selects the PostgreSQL implementation.
+
+Row Level Security remains enabled and no broad anonymous policy is created. The configured direct PostgreSQL role has sufficient server-side privileges to access the table. Browser users cannot query `public.rooms` directly through this application, and `DATABASE_URL` is never sent to React.
+
+WebSocket objects cannot be stored meaningfully in PostgreSQL: they are live network handles tied to one process and one connection lifetime. Only room document state is durable. Participant records, socket ownership, and connection sets remain in memory and are rebuilt as users join after a restart.
+
 ### Server-side state
 
-The server maintains four related collections:
+The server combines one durable collection with three process-local collections:
 
 | Collection | Key | Value | Purpose |
 | --- | --- | --- | --- |
-| `RoomStore` | Room UUID | `Room` | Canonical editor state and participant references |
-| `ParticipantStore` | Participant UUID | `Participant` | Temporary participant profile |
+| `public.rooms` | Room UUID | Code, language, revision, timestamps | Durable canonical editor state |
+| `ParticipantStore` | Participant UUID | Participant and room ID | Temporary participant profile and membership |
 | `roomConnections` | Room UUID | Set of WebSocket connections | Live sockets currently attached to each room |
 | `socketParticipants` | WebSocket connection | Room and participant IDs | Ownership of each authenticated room connection |
 
-The stores are process-local. Restarting the server deletes every room, participant, revision, and connection record.
+Restarting the server removes participants and connections, but PostgreSQL preserves every room and its latest editor revision. A recovered room correctly begins with zero connected participants.
 
 ## Domain model
 
@@ -149,6 +181,7 @@ interface Room {
   };
   participantIds: string[];
   createdAt: number;
+  updatedAt: number;
 }
 ```
 
@@ -180,14 +213,17 @@ sequenceDiagram
     participant C as React client
     participant H as Express API
     participant S as RoomService
-    participant R as RoomStore
+    participant R as PostgresRoomRepository
+    participant DB as PostgreSQL
 
     U->>C: Click Create Room
     C->>H: POST /rooms { language: "python", code }
     H->>H: Validate language and code size
     H->>S: createRoom(language, code)
-    S->>R: Save room with revision 0
-    R-->>S: Stored room
+    S->>R: create(room at revision 0)
+    R->>DB: INSERT parameterized room row
+    DB-->>R: Stored row
+    R-->>S: Mapped Room
     S-->>H: Room
     H-->>C: 201 Created + Room
     C->>C: Save room state
@@ -202,7 +238,7 @@ When the application loads a URL matching `/rooms/:roomId`:
 
 1. The client extracts the room ID from `window.location.pathname`.
 2. It requests `GET /rooms/:roomId`.
-3. The server validates the UUID and reads the room from `RoomStore`.
+3. The server validates the UUID and asks `PostgresRoomRepository` to query PostgreSQL.
 4. The client replaces its local code with the returned canonical state.
 5. The room editor remains read-only until the user joins and the WebSocket attachment succeeds.
 
@@ -219,18 +255,20 @@ sequenceDiagram
     participant H as Express API
     participant S as RoomService
     participant W as WebSocket server
-    participant M as In-memory stores
+    participant DB as PostgreSQL
+    participant P as ParticipantStore
 
     U->>C: Enter display name
     C->>H: POST /rooms/:roomId/join
     H->>H: Validate UUID and display name
     H->>S: joinRoom(roomId, displayName)
-    S->>M: Save participant and add ID to room
+    S->>DB: Confirm persistent room exists
+    S->>P: Save temporary participant membership
     H-->>C: 201 Created + Participant
     C->>W: Open WebSocket
     W-->>C: connection:ready
     C->>W: room:join { roomId, participantId }
-    W->>M: Verify room and participant relationship
+    W->>S: Verify room and participant relationship
     W->>W: Register socket ownership
     W-->>C: room:joined { roomId, editorState }
     W-->>C: presence:update { participants }
@@ -246,31 +284,37 @@ Code editing is optimistic for the sender:
 
 1. Monaco reports a new full-document string.
 2. The sender immediately updates local React state.
-3. If its socket is open and attached, it sends `code:update` with the full source string.
+3. If its socket is open and attached, it queues `code:update` with the full source string and expected revision.
 4. The server validates the value and its UTF-8 byte size.
-5. `RoomService` replaces the room's canonical code and increments the revision.
-6. The server broadcasts the accepted code and revision to every other socket in the room.
-7. Other clients replace their Monaco value with the received code.
+5. `RoomService` asks the repository to update only if PostgreSQL still has the expected revision.
+6. PostgreSQL persists code and the next revision and advances `updated_at` atomically.
+7. Only after persistence succeeds does the server broadcast the accepted code and revision.
+8. The sender treats its copy as an acknowledgement and sends any newer queued edit; other clients update Monaco.
 
 ```mermaid
 sequenceDiagram
     participant A as Client A
     participant W as WebSocket server
     participant S as RoomService
-    participant R as RoomStore
+    participant R as PostgresRoomRepository
+    participant DB as PostgreSQL
     participant B as Client B
 
     A->>A: Apply edit locally
-    A->>W: code:update { code }
-    W->>W: Validate membership and size
-    W->>S: updateCode(roomId, code)
-    S->>R: Replace code; revision += 1
-    S-->>W: Updated room
+    A->>W: code:update { code, revision }
+    W->>W: Validate membership, size, revision
+    W->>S: updateCode(roomId, code, expectedRevision)
+    S->>R: updateEditorState(...)
+    R->>DB: UPDATE ... WHERE revision = expected
+    DB-->>R: Persisted row or no row
+    R-->>S: Updated Room or null
+    S-->>W: Persisted Room
+    W-->>A: code:update acknowledgement
     W-->>B: code:update { code, revision }
     B->>B: Replace local editor value
 ```
 
-The server excludes the sender from the code broadcast because the sender has already applied the edit locally.
+The sender receives the accepted update as an acknowledgement. The client allows only one update in flight and keeps the newest local document queued while it waits.
 
 ### 5. Python-only frontend policy
 
@@ -290,7 +334,7 @@ When a socket joins or disconnects, the server:
 4. on disconnect, removes the socket, participant reference, and participant record;
 5. removes an empty room connection set when the final socket leaves.
 
-Rooms themselves are not deleted when empty. A room remains available until the server process restarts.
+Rooms themselves are not deleted when empty. They remain in PostgreSQL across backend restarts; room expiration is outside the current milestone.
 
 If the HTTP join succeeds but the WebSocket never attaches, that participant record is not displayed in presence. It currently remains in memory because disconnect cleanup only runs for an attached socket.
 
@@ -330,8 +374,8 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | Type | Payload | Requirement |
 | --- | --- | --- |
 | `room:join` | `{ roomId, participantId }` | IDs must be valid, related UUIDs issued through HTTP |
-| `code:update` | `{ code }` | Socket must have joined; code must be at most 20 KiB |
-| `language:update` | `{ language }` | Backend compatibility capability; the Python-only frontend does not send it |
+| `code:update` | `{ code, revision? }` | Socket must have joined; code must be at most 20 KiB; current clients send the expected revision |
+| `language:update` | `{ language, revision? }` | Backend compatibility capability; the Python-only frontend does not send it |
 
 ### Server-to-client messages
 
@@ -339,19 +383,20 @@ The default WebSocket URL is `ws://localhost:3000`. Every message is a JSON obje
 | --- | --- | --- |
 | `connection:ready` | No additional fields | Transport connection is open; room is not joined yet |
 | `room:joined` | `{ roomId, editorState }` | Room attachment succeeded and canonical state is supplied |
-| `code:update` | `{ code, revision }` | Another participant changed the document |
+| `code:update` | `{ code, revision, participantId }` | Persisted editor update or sender acknowledgement |
 | `language:update` | `{ language, revision }` | Backend compatibility event; the Python-only frontend ignores it |
 | `presence:update` | `{ participants }` | Complete list of currently connected participants |
-| `room:error` | `{ error }` | The server rejected or could not parse a message |
+| `room:error` | `{ error, editorState? }` | The server rejected a message; stale updates include canonical state for resynchronization |
 
 ## Consistency and conflict behavior
 
-The current synchronization model sends the entire document for every change and uses server arrival order:
+The current synchronization model sends the entire document and protects each write with a database revision comparison:
 
-- The last update processed by the server becomes canonical.
+- PostgreSQL is authoritative; a successful broadcast always corresponds to a committed row.
 - Each accepted code or language update increments one shared room revision.
 - WebSockets preserve message order per connection.
-- The client accepts revisions from the server but does not yet use them to reject stale events or request missing state.
+- The client sends its expected revision and queues one in-flight update.
+- A stale revision is rejected and cannot overwrite the newer database state.
 - There is no operational transformation, CRDT, text patching, cursor sharing, or selection sharing.
 
 This model is deliberately simple and suitable for the current MVP. Concurrent edits to different parts of a document can overwrite one another because each message contains the entire document.
@@ -374,6 +419,8 @@ This model is deliberately simple and suitable for the current MVP. Concurrent e
 ### Prerequisites
 
 - Node.js and npm
+- A Supabase project with the `public.rooms` migration applied
+- `DATABASE_URL` in `app/server/.env`
 - Two terminal sessions
 
 ### Install dependencies
@@ -434,16 +481,38 @@ npm run build
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `DATABASE_URL` | Required | Supabase PostgreSQL connection string used only by the backend |
 | `PORT` | `3000` | Shared HTTP and WebSocket port |
 | `CLIENT_ORIGIN` | `http://localhost:5173` | Browser origin accepted by CORS |
 
 Example:
 
 ```bash
-PORT=8080 CLIENT_ORIGIN=https://app.example.com npm start
+DATABASE_URL=postgresql://... PORT=8080 CLIENT_ORIGIN=https://app.example.com npm start
 ```
 
 For a production HTTPS client, use `https://` for `VITE_API_URL` and `wss://` for `VITE_WS_URL` to avoid mixed-content browser failures.
+
+`DATABASE_URL` must never use a `VITE_` prefix or be exposed to the React client. Copy `app/server/.env.example` to `.env` for local development; `.env` is ignored by Git.
+
+### Test backend restart recovery
+
+1. Start the backend and frontend.
+2. Create and join a room.
+3. Edit Python code and confirm it appears in a second joined tab.
+4. Record the `/rooms/:roomId` URL.
+5. Stop the backend completely and restart it.
+6. Reload the recorded URL and confirm the code is restored.
+7. Join again, because participant presence is intentionally ephemeral.
+8. Edit again and confirm WebSocket synchronization continues.
+
+The stored row can be inspected with:
+
+```sql
+select id, code, language, revision, created_at, updated_at
+from public.rooms
+order by updated_at desc;
+```
 
 ## Build and verification
 
@@ -457,17 +526,17 @@ npm run build
 npm start
 ```
 
-The client currently has no automated test command. The server's placeholder `npm test` script intentionally exits with an error because a test suite has not been added yet.
+The client currently has no automated test command. The backend uses Node's built-in test runner; `npm test` builds TypeScript and runs focused mapper, repository, service, presence, parameterization, and stale-revision tests without an additional test dependency.
 
 ## Current limitations
 
-- Rooms and participants disappear whenever the server restarts.
-- A single server process owns all rooms; there is no shared datastore or horizontal scaling strategy.
+- Participants and live connections disappear whenever the server restarts; rooms persist.
+- Room state is shared through PostgreSQL, but presence still assumes one backend process and is not horizontally coordinated.
 - There is no authentication, authorization, room password, or ownership model.
 - Anyone with a valid room URL can request a participant identity and join.
 - There is no rate limiting or abuse protection.
 - Reconnection is not automatic, and participant identity is not persisted across reloads.
-- Full-document last-write-wins updates can lose concurrent edits.
+- Full-document revision checks reject simultaneous stale edits rather than merging them; there is no CRDT or operational transformation.
 - The UI uses browser prompts and alerts for join and error flows.
 - The client and server duplicate protocol/domain types rather than importing a shared schema.
 - Rooms are not expired or garbage-collected.
@@ -517,7 +586,7 @@ Before or alongside compiler work, the platform would benefit from:
 - automated unit tests for `RoomService` and validation helpers;
 - HTTP and WebSocket integration tests;
 - a shared package for domain types and runtime schemas;
-- persistent room storage with explicit expiration;
+- explicit room expiration and deletion policy;
 - reconnect tokens or durable participant sessions;
 - structured error payloads with stable error codes;
 - patch-based or CRDT synchronization for conflict-safe editing;
@@ -526,4 +595,4 @@ Before or alongside compiler work, the platform would benefit from:
 
 ## Design summary
 
-Code Together currently treats the Node server as the source of truth for room state and uses React as a responsive projection of that state. HTTP establishes resources and identities; WebSockets attach live sessions and distribute accepted changes. This separation keeps the MVP understandable while leaving clear boundaries for persistence, stronger collaboration algorithms, authentication, and a future isolated compiler service.
+Code Together treats PostgreSQL as the source of truth for room state and React as a responsive projection of that state. HTTP establishes resources and temporary identities; WebSockets attach live sessions and distribute only successfully persisted changes. This separation keeps the MVP understandable while leaving clear boundaries for stronger collaboration algorithms, authentication, expiration, and a future isolated compiler service.

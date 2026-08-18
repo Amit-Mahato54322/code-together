@@ -33,6 +33,14 @@ function isParticipant(value: unknown): value is Participant {
   );
 }
 
+function isRevision(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
 // Read a room ID from a URL shaped like:
 //
 // /rooms/abc123
@@ -76,6 +84,37 @@ function App() {
   // without causing a re-render whenever the socket changes.
   const socketRef = useRef<WebSocket | null>(null);
 
+  // The server revision is stored in a ref because changing it should not
+  // cause a visual re-render. It is included with every code update.
+  const revisionRef = useRef(0);
+  const updateInFlightRef = useRef(false);
+  const pendingCodeRef = useRef<string | null>(null);
+
+  function sendPendingCodeUpdate(): void {
+    const socket = socketRef.current;
+    const pendingCode = pendingCodeRef.current;
+
+    if (
+      !socket ||
+      socket.readyState !== WebSocket.OPEN ||
+      updateInFlightRef.current ||
+      pendingCode === null
+    ) {
+      return;
+    }
+
+    pendingCodeRef.current = null;
+    updateInFlightRef.current = true;
+
+    socket.send(
+      JSON.stringify({
+        type: "code:update",
+        code: pendingCode,
+        revision: revisionRef.current,
+      })
+    );
+  }
+
   // When the application first loads, check whether the URL
   // already contains a room ID.
   //
@@ -98,6 +137,7 @@ function App() {
 
         setRoomId(room.id);
         setCode(room.editorState.code);
+        revisionRef.current = room.editorState.revision;
       } catch (error) {
         console.error("Could not load room:", error);
 
@@ -162,8 +202,14 @@ function App() {
           setSocketStatus("connected");
 
           if (isRecord(message.editorState)) {
-            if (typeof message.editorState.code === "string") {
+            if (
+              typeof message.editorState.code === "string" &&
+              isRevision(message.editorState.revision)
+            ) {
               setCode(message.editorState.code);
+              revisionRef.current = message.editorState.revision;
+              updateInFlightRef.current = false;
+              pendingCodeRef.current = null;
             }
           }
 
@@ -173,9 +219,42 @@ function App() {
         // Another collaborator changed the code.
         if (
           message.type === "code:update" &&
-          typeof message.code === "string"
+          typeof message.code === "string" &&
+          isRevision(message.revision)
         ) {
-          setCode(message.code);
+          if (message.revision < revisionRef.current) {
+            return;
+          }
+
+          revisionRef.current = message.revision;
+
+          if (message.participantId === participantId) {
+            updateInFlightRef.current = false;
+            sendPendingCodeUpdate();
+          } else {
+            setCode(message.code);
+          }
+
+          return;
+        }
+
+        if (message.type === "room:error") {
+          console.error(
+            "Room message rejected:",
+            typeof message.error === "string" ? message.error : "Unknown error"
+          );
+
+          if (
+            isRecord(message.editorState) &&
+            typeof message.editorState.code === "string" &&
+            isRevision(message.editorState.revision)
+          ) {
+            setCode(message.editorState.code);
+            revisionRef.current = message.editorState.revision;
+          }
+
+          updateInFlightRef.current = false;
+          pendingCodeRef.current = null;
           return;
         }
 
@@ -199,6 +278,8 @@ function App() {
       console.log("WebSocket disconnected");
       setSocketStatus("disconnected");
       setParticipants([]);
+      updateInFlightRef.current = false;
+      pendingCodeRef.current = null;
     };
 
     // Runs if the browser encounters a WebSocket-level error.
@@ -235,6 +316,7 @@ function App() {
       // Save the backend-generated room ID in React state.
       setRoomId(room.id);
       setCode(room.editorState.code);
+      revisionRef.current = room.editorState.revision;
 
       // Update the browser URL without reloading the page.
       // This gives us a shareable room link such as:
@@ -293,12 +375,8 @@ function App() {
       socket.readyState === WebSocket.OPEN &&
       socketStatus === "connected"
     ) {
-      socket.send(
-        JSON.stringify({
-          type: "code:update",
-          code: newCode,
-        })
-      );
+      pendingCodeRef.current = newCode;
+      sendPendingCodeUpdate();
     }
   }
 
