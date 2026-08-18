@@ -1,135 +1,157 @@
 import { randomUUID } from "node:crypto";
 
-import type{
-    ProgrammingLanguage,
-    Room,
-} from "../domain/room.js"
-
 import type { Participant } from "../domain/participant.js";
-
-import { RoomStore } from "../store/roomStore.js";
+import type {
+  ProgrammingLanguage,
+  Room,
+} from "../domain/room.js";
+import type { RoomRepository } from "../repositories/roomRepository.js";
 import { ParticipantStore } from "../store/participantStore.js";
 
 export class RoomService {
   constructor(
-    private readonly roomStore: RoomStore,
-    private readonly participantStore: ParticipantStore
+    private readonly roomRepository: RoomRepository,
+    private readonly participantStore: ParticipantStore,
   ) {}
 
-  createRoom(
+  async createRoom(
     language: ProgrammingLanguage = "typescript",
-    code = ""
-  ): Room {
+    code = "",
+  ): Promise<Room> {
+    const now = Date.now();
     const room: Room = {
       id: randomUUID(),
-
       editorState: {
         code,
         language,
         revision: 0,
       },
-
       participantIds: [],
-
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
     };
 
-    // Save the new room in memory before returning it.
-    this.roomStore.save(room);
+    const createdRoom = await this.roomRepository.create(room);
 
-    return room;
+    return this.withActiveParticipants(createdRoom);
   }
 
-  getRoom(roomId: string): Room | undefined {
-    return this.roomStore.get(roomId);
+  async getRoom(roomId: string): Promise<Room | null> {
+    const room = await this.roomRepository.findById(roomId);
+
+    return room ? this.withActiveParticipants(room) : null;
   }
 
   getParticipants(roomId: string): Participant[] {
-    const room = this.roomStore.get(roomId);
-
-    if (!room) {
-      return [];
-    }
-
-    return room.participantIds
-      .map((participantId) => this.participantStore.get(participantId))
-      .filter((participant): participant is Participant => participant !== undefined);
+    return this.participantStore.getByRoomId(roomId);
   }
 
-  joinRoom(
+  getParticipantForRoom(
     roomId: string,
-    displayName: string
-  ): Participant | undefined {
-    // First, check whether the room actually exists.
-    const room = this.roomStore.get(roomId);
-
-    if (!room) {
-      return undefined;
+    participantId: string,
+  ): Participant | null {
+    if (!this.participantStore.belongsToRoom(participantId, roomId)) {
+      return null;
     }
 
-    // Create a new participant for this room session.
+    return this.participantStore.get(participantId) ?? null;
+  }
+
+  async joinRoom(
+    roomId: string,
+    displayName: string,
+  ): Promise<Participant | null> {
+    const room = await this.roomRepository.findById(roomId);
+
+    if (!room) {
+      return null;
+    }
+
     const participant: Participant = {
       id: randomUUID(),
       displayName,
       joinedAt: Date.now(),
     };
 
-    // Store the participant separately.
-    this.participantStore.save(participant);
-
-    // Add the participant's ID to the room.
-    room.participantIds.push(participant.id);
-
-    // Save the updated room back into the RoomStore.
-    this.roomStore.save(room);
+    this.participantStore.save(roomId, participant);
 
     return participant;
   }
 
   leaveRoom(roomId: string, participantId: string): boolean {
-    const room = this.roomStore.get(roomId);
-
-    if (!room || !room.participantIds.includes(participantId)) {
+    if (!this.participantStore.belongsToRoom(participantId, roomId)) {
       return false;
     }
 
-    room.participantIds = room.participantIds.filter(
-      (currentParticipantId) => currentParticipantId !== participantId
-    );
-    this.roomStore.save(room);
-    this.participantStore.delete(participantId);
-
-    return true;
+    return this.participantStore.delete(participantId);
   }
 
-  updateCode(roomId: string, code: string): Room | undefined {
-    const room = this.roomStore.get(roomId);
-
-    if (!room) {
-      return undefined;
-    }
-
-    room.editorState.code = code;
-    room.editorState.revision += 1;
-    this.roomStore.save(room);
-
-    return room;
-  }
-
-  updateLanguage(
+  async updateCode(
     roomId: string,
-    language: ProgrammingLanguage
-  ): Room | undefined {
-    const room = this.roomStore.get(roomId);
+    code: string,
+    expectedRevision?: number,
+  ): Promise<Room | null> {
+    const room = await this.roomRepository.findById(roomId);
 
     if (!room) {
-      return undefined;
+      return null;
     }
 
-    room.editorState.language = language;
-    room.editorState.revision += 1;
-    this.roomStore.save(room);
+    const revisionToReplace = expectedRevision ?? room.editorState.revision;
 
-    return room;
+    if (room.editorState.revision !== revisionToReplace) {
+      return null;
+    }
+
+    const updatedRoom = await this.roomRepository.updateEditorState(
+      roomId,
+      {
+        ...room.editorState,
+        code,
+        revision: revisionToReplace + 1,
+      },
+      revisionToReplace,
+    );
+
+    return updatedRoom ? this.withActiveParticipants(updatedRoom) : null;
+  }
+
+  async updateLanguage(
+    roomId: string,
+    language: ProgrammingLanguage,
+    expectedRevision?: number,
+  ): Promise<Room | null> {
+    const room = await this.roomRepository.findById(roomId);
+
+    if (!room) {
+      return null;
+    }
+
+    const revisionToReplace = expectedRevision ?? room.editorState.revision;
+
+    if (room.editorState.revision !== revisionToReplace) {
+      return null;
+    }
+
+    const updatedRoom = await this.roomRepository.updateEditorState(
+      roomId,
+      {
+        ...room.editorState,
+        language,
+        revision: revisionToReplace + 1,
+      },
+      revisionToReplace,
+    );
+
+    return updatedRoom ? this.withActiveParticipants(updatedRoom) : null;
+  }
+
+  private withActiveParticipants(room: Room): Room {
+    return {
+      ...room,
+      participantIds: this.participantStore
+        .getByRoomId(room.id)
+        .map((participant) => participant.id),
+    };
   }
 }

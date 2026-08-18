@@ -13,6 +13,7 @@ export interface Room {
 
   participantIds: string[];
   createdAt: number;
+  updatedAt: number;
 }
 
 export interface Participant {

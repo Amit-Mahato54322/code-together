@@ -1,315 +1,213 @@
 # Backend Learning Notes
 
-## Room Domain Model
+## Why Room Persistence Was Added
+
+The first Code Together backend stored rooms in a JavaScript `Map`. That made the real-time behavior easy to learn, but every room, document, and revision disappeared when the Node process restarted. PostgreSQL is now the authoritative source of truth, so a shared room URL restores the latest accepted document after a complete backend restart.
 
-- `Room` represents one collaborative coding session.
-- `EditorState` contains code, language, and revision.
-- The server owns the canonical editor state.
-- `revision` helps detect stale/concurrent updates.
+Supabase was selected because it provides managed PostgreSQL while still supporting the standard `pg` driver and normal parameterized SQL. The React client does not use Supabase credentials or query the rooms table directly.
 
-## Participant Domain Model
+## Persistent and Ephemeral State
 
-- A Participant represents someone's presence in a room.
-- Participant identity is different from a WebSocket connection.
-- In the current simple session model, refreshing or reconnecting means joining again with a new temporary participant.
+PostgreSQL persists:
 
-## RoomStore
+- room UUID;
+- source code;
+- language metadata;
+- editor revision;
+- creation timestamp; and
+- last-update timestamp.
 
-- A store is responsible for storing and retrieving data.
-- `Map<string, Room>` gives room ID → Room lookup.
-- `private` provides encapsulation.
-- `readonly` prevents reassigning the Map reference.
-- In-memory state disappears when the server restarts.
+Backend memory retains:
 
-## RoomService
+- temporary participants and their room membership;
+- live WebSocket objects;
+- room-to-socket sets;
+- socket-to-participant mappings; and
+- connection lifecycle state.
 
-/*
-Learning Notes - RoomService
+A WebSocket is a live operating-system/network resource, not application data that can be reconstructed from a database row. After restart, a room has its document but correctly has zero connected participants.
 
-1. RoomService contains room-related business logic.
-   It decides how rooms are created and retrieved.
+## Repository Architecture
 
-2. RoomStore is responsible only for storing rooms.
-   RoomService uses RoomStore instead of directly managing a Map.
+```text
+Express and WebSocket handlers
+              ↓
+          RoomService
+              ↓
+        RoomRepository
+              ↓
+  PostgresRoomRepository
+              ↓
+    Supabase PostgreSQL
+```
 
-3. The RoomStore is passed into RoomService through the constructor.
-   This is dependency injection:
-   RoomService depends on storage, but does not create the storage itself.
+Relevant files:
 
-4. randomUUID() generates a unique ID for each room.
+- `src/config/database.ts` creates the shared `pg.Pool` and validates `DATABASE_URL`.
+- `src/repositories/roomRepository.ts` defines the application-facing persistence contract.
+- `src/repositories/postgresRoomMapper.ts` converts database rows to domain rooms.
+- `src/repositories/postgresRoomRepository.ts` contains parameterized SQL.
+- `src/store/roomStore.ts` is an in-memory implementation useful for focused service tests.
+- `src/services/roomService.ts` contains room and revision rules.
+- `src/store/participantStore.ts` owns ephemeral participant membership.
+- `src/index.ts` handles transport and constructs the concrete dependencies.
 
-5. A new room starts with:
-   - empty code
-   - selected/default language
-   - revision 0
-   - no participants
-   - current creation timestamp
+`RoomService` never imports `pg`, a PostgreSQL pool, or the concrete PostgreSQL repository.
 
-6. createRoom() follows this flow:
-   create Room -> save Room -> return Room
+## Room Row Mapping
 
-7. getRoom() may return undefined because the requested room
-   might not exist.
+PostgreSQL uses flat snake_case columns:
 
-Architecture:
-future HTTP/WebSocket handler
-        -> RoomService
-        -> RoomStore
-        -> in-memory Map
-*/
+```text
+id, code, language, revision, created_at, updated_at
+```
 
+The domain uses a nested camelCase shape:
 
+```ts
+interface Room {
+  id: string;
+  editorState: {
+    code: string;
+    language: "typescript" | "javascript" | "python";
+    revision: number;
+  };
+  participantIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+```
 
-## ParticipantStore
+`mapRoomRow` performs this conversion in one place. PostgreSQL `timestamptz` values arrive from `pg` as `Date` objects and are converted to epoch milliseconds to preserve the existing HTTP contract. Database language strings are narrowed before becoming domain values. Participant IDs are reconstructed from live `ParticipantStore` state rather than database rows.
 
-- ParticipantStore keeps participant data in server memory.
-- It uses `Map<string, Participant>` for ID -> participant lookup.
-- `save()` adds or replaces a participant.
-- `get()` returns `Participant | undefined` because an ID may not exist.
-- `delete()` removes a participant from memory.
-- RoomStore and ParticipantStore are separate because rooms and participants are separate domain concepts.
-- We are intentionally not creating a generic Store abstraction yet because the two stores may need different behavior later.
+## Room Creation Flow
 
+1. `POST /rooms` validates language and code size.
+2. `RoomService.createRoom` generates the UUID, revision `0`, and timestamps.
+3. `RoomRepository.create` receives the domain room.
+4. `PostgresRoomRepository` inserts parameter values into `public.rooms`.
+5. PostgreSQL returns the stored row.
+6. The mapper returns a domain `Room`.
+7. Express returns the existing `201` response.
 
+If insertion fails, Express logs the internal error and returns `{ "error": "Could not create room" }` with status `500`. It does not claim success.
 
+## Room Loading and Restart Recovery
 
-## Joining a Room
+1. React extracts the UUID from `/rooms/:roomId`.
+2. It requests `GET /rooms/:roomId`.
+3. `RoomService.getRoom` calls `RoomRepository.findById`.
+4. PostgreSQL returns the durable row or no row.
+5. The mapper restores code, language, revision, and timestamps.
+6. React restores Monaco from the returned editor state.
 
-- `joinRoom(roomId, displayName)` is business logic inside RoomService.
-- The service first checks whether the room exists.
-- If the room does not exist, it returns `undefined`.
-- If the room exists:
-  1. Create a Participant.
-  2. Save the Participant in ParticipantStore.
-  3. Add the participant ID to the Room.
-  4. Save the updated Room.
-  5. Return the Participant.
-- RoomService does not know anything about HTTP status codes yet.
-- For this small project, directly mutating the in-memory Room object is acceptable and keeps the code simple.
+The HTTP `404` behavior remains unchanged for a valid UUID that has no row. A restart destroys sockets and participants but cannot destroy the PostgreSQL row, which is why the URL continues to work.
 
+## Joining and Presence
 
+`RoomService.joinRoom` first confirms through `RoomRepository` that the durable room exists. It then creates a temporary participant in `ParticipantStore`. The participant-to-room relationship is not written to the room row.
 
-## Node + Express Server Foundation
+The WebSocket `room:join` handler validates that both the persistent room and temporary participant relationship exist before registering the live socket. Disconnect cleanup removes the participant and socket mappings but does not alter the PostgreSQL room.
 
-- The frontend and backend are separate applications and have separate package.json files.
-- Express is the HTTP framework used by the backend.
-- `src/index.ts` is the backend entry point.
-- `tsx` runs TypeScript directly during development and can restart the server when files change.
-- `tsconfig.json` controls how TypeScript is checked and compiled.
-- `src/` contains TypeScript source code.
-- `dist/` will contain compiled JavaScript.
-- `app.use(express.json())` is middleware that parses JSON request bodies.
-- A route consists of an HTTP method and path, such as `GET /health`.
-- `response.json()` sends JSON back to the client.
-- `app.listen(3000)` starts the backend on port 3000.
-- The frontend and backend run as separate processes:
-  - frontend: localhost:5173
-  - backend: localhost:3000
-
-
-
-## Backend Build
-
-- `npm run dev` runs TypeScript directly with tsx for development.
-- `npm run build` uses the TypeScript compiler (`tsc`) to compile all backend source files.
-- Compiled JavaScript goes into `dist/`.
-- `npm start` runs the compiled JavaScript from `dist/`.
-- A backend can run in development while another TypeScript file still contains compile errors, so production build validation is an important checkpoint.
-
-
-## POST /rooms
-
-- `POST /rooms` creates a new collaborative room.
-- The HTTP route calls `RoomService` instead of creating rooms directly.
-- `index.ts` is where the app is assembled:
-  - create stores
-  - create services
-  - register routes
-  - start server
-- `express.json()` parses incoming JSON bodies.
-- HTTP data must be validated at runtime because TypeScript only checks source code.
-- `unknown` is useful for untrusted values.
-- `isProgrammingLanguage()` is a type guard that checks whether a value is one of the supported languages.
-- `201 Created` is returned when room creation succeeds.
-- `400 Bad Request` is returned for an unsupported language.
-
-## GET /rooms/:roomId
-
-- `:roomId` is a dynamic route parameter.
-- Express exposes route parameters through `request.params`.
-- `RoomService.getRoom()` returns either a Room or undefined.
-- The route converts:
-  - existing Room -> 200 OK
-  - missing Room -> 404 Not Found
-- The service layer does not know about HTTP status codes.
-
-
-## POST /rooms/:roomId/join
-
-- app/client/src/api/rooms.ts
-
-- This endpoint lets a participant join an existing room.
-- `roomId` comes from `request.params`.
-- `displayName` comes from `request.body`.
-- External request data must be validated at runtime.
-- `trim()` removes unnecessary whitespace from user input.
-- The route calls `RoomService.joinRoom()` instead of directly modifying stores.
-- Responses:
-  - 201 -> participant created
-  - 400 -> invalid display name
-  - 404 -> room does not exist
-- After joining, the Participant is stored separately and its ID is added to the Room.
-
-
-
-## Frontend to Backend Communication
-
-- Frontend runs on localhost:5173 and backend runs on localhost:3000.
-- Because they use different ports, the browser treats them as different origins.
-- CORS allows the backend to explicitly permit requests from the frontend.
-- React uses the browser `fetch()` API to make HTTP requests.
-- `async` functions return Promises.
-- `await` waits for asynchronous operations such as network requests.
-- `JSON.stringify()` converts JavaScript objects into JSON before sending them.
-- Express `express.json()` parses incoming JSON back into request.body.
-- `fetch()` does not automatically throw for HTTP errors like 400 or 404, so `response.ok` should be checked.
-
-
-## Creating a Room from React
-
-- Clicking Create Room runs an async React event handler.
-- The handler calls `createRoom(language)` from `api/rooms.ts`.
-- `createRoom()` sends `POST /rooms` to the Express backend.
-- The backend generates the real room UUID and returns the Room.
-- React stores the returned ID using `roomId` state.
-- `string | null` represents whether a room has been created yet.
-- `isCreatingRoom` disables the button while the request is running.
-- `try/catch/finally` handles success, errors, and cleanup.
-- This is the first complete frontend -> backend -> frontend round trip.
-
-## Shareable Room URL
-
-- After creating a room, the frontend receives a backend-generated room ID.
-- `window.history.pushState()` changes the browser URL without refreshing the page.
-- A created room now gets a URL like `/rooms/<roomId>`.
-- This URL will later be shared with another user.
-- We are not using React Router yet because the routing needs are still simple.
-
-
-## Loading a Shared Room
-
-- A room URL looks like `/rooms/<roomId>`.
-- `window.location.pathname` lets the frontend inspect the current URL.
-- `getRoomIdFromUrl()` extracts the room ID from the path.
-- `useEffect(..., [])` runs once when App first loads.
-- If a room ID exists in the URL, React calls `GET /rooms/:roomId`.
-- The returned room updates:
-  - roomId
-  - editor code
-  - programming language
-- This allows someone to open a shared room link directly.
-- Network requests are side effects, so they are performed inside `useEffect`.
-
-
-## Joining a Shared Room
-
-- A browser first loads a room using GET /rooms/:roomId.
-- Joining is a separate action using POST /rooms/:roomId/join.
-- The backend creates a Participant and returns its ID.
-- React stores the participant ID for the current browser session.
-- Room ID identifies the collaboration room.
-- Participant ID identifies one person/session inside that room.
-- This identity will later be used for WebSocket presence and code updates.
-
-
-
-## WebSocket Foundation
-
-- HTTP usually follows request -> response -> connection finishes.
-- WebSockets create a persistent two-way connection between browser and server.
-- `ws` provides WebSocket support for our Node backend.
-- We use `createServer(app)` so Express HTTP routes and WebSockets can share port 3000.
-- `WebSocketServer` listens for WebSocket connections.
-- The `connection` event runs when a browser connects.
-- `socket.send()` sends a message to that browser.
-- The `close` event runs when the browser disconnects.
-- WebSocket messages are commonly serialized using JSON.
-- WebSockets begin with an HTTP upgrade handshake.
-
-
-## React WebSocket Connection
-
-- React opens the WebSocket only after the browser has joined a room.
-- The WebSocket effect depends on `roomId` and `participantId`.
-- `new WebSocket("ws://localhost:3000")` starts the persistent connection.
-- `onopen` means the connection is ready.
-- `onmessage` receives messages from the backend.
-- `onclose` runs when the connection ends.
-- `useEffect` cleanup closes the socket so stale connections are not left open.
-- WebSocket connection state is stored in React so the UI can show connecting/connected/disconnected.
-
-
-## Attaching WebSockets to Rooms
-
-- Opening a WebSocket only creates a network connection.
-- The browser sends a `room:join` message containing roomId and participantId.
-- The backend verifies that:
-  - the room exists
-  - the participant belongs to the room
-- `Map<string, Set<WebSocket>>` groups active WebSocket connections by room.
-- A Set prevents duplicate socket entries and makes removal easy.
-- HTTP participant identity and WebSocket connection identity are separate concepts.
-- When a socket disconnects, it is removed from the room's connection Set.
-- Once sockets are grouped by room, the server can broadcast messages only to collaborators in that room.
-
-
-## Live Code Synchronization
-
-- Monaco calls `handleCodeChange()` whenever the local user edits code.
-- `useRef()` stores the current WebSocket object without triggering React renders.
-- Local edits update React state immediately.
-- When the WebSocket is connected, the browser sends a `code:update` message.
-- The backend updates the Room's canonical editor state and increments its revision.
-- The backend broadcasts the update to every other WebSocket connected to that room.
-- Other browsers receive `code:update` and call `setCode()`, which updates Monaco.
-- The sender is excluded from the broadcast because its editor already contains the change.
-- The current implementation sends the whole code document on every change.
-- Simultaneous edits currently behave roughly as last-write-wins; advanced conflict resolution can be added later if needed.
-
-
-## Participant Presence and Disconnect Cleanup
-
-- A successful HTTP join creates the temporary Participant, while `room:join` attaches that participant to a live WebSocket.
-- `socketParticipants` records which participant owns each accepted socket. Participant identity and connection identity are related, but they are not the same value.
-- Presence is based on accepted live sockets, so an HTTP join that never opens a WebSocket is not displayed as online.
-- After a participant connects, the server sends `presence:update` to every open socket in that room.
-- The payload contains simple Participant objects, which is enough to render display names without accounts or profiles.
-- When the socket closes, the server:
-  1. removes the socket from its room's `Set`;
-  2. removes the socket-to-participant association;
-  3. deletes the Participant from `ParticipantStore`;
-  4. removes the participant ID from `Room.participantIds`;
-  5. removes an empty room connection Set; and
-  6. broadcasts the smaller participant list.
-- Refreshing a page counts as leaving. The user must join again. This keeps temporary identity easy to understand and avoids a reconnect-token system.
-- Presence broadcasts use only the target room's Set, so names cannot leak into another room.
-
-
-## Shared Language Selection
-
-- The supported languages are `python`, `javascript`, and `typescript`.
-- A connected client requests a change with `language:update`.
-- Runtime validation checks the value because TypeScript types do not validate data received over a WebSocket.
-- The socket must have joined a room before it may change that room's language.
-- `RoomService.updateLanguage()` updates the canonical `EditorState` and increments its revision.
-- The server broadcasts the accepted value to every socket in that room, including the sender. Waiting for this message keeps the server authoritative.
-- Each browser updates both its selector and Monaco language mode from that one shared value.
-
-
-## Small Input Limits
-
-- Express accepts JSON bodies up to 32 KB.
-- Display names must contain 1-40 characters after trimming.
-- Editor code is capped at 20 KB, measured as UTF-8 bytes rather than JavaScript character count.
-- The WebSocket server rejects payloads above 64 KB before application message handling.
-- These limits are intentionally readable and proportional to a small educational room application.
+## Code Update and Revision Consistency
+
+The current client sends the complete document and its expected revision. It keeps at most one update in flight and queues the newest local document while waiting for acknowledgement.
+
+For an accepted update:
+
+1. The WebSocket handler validates membership, code size, and revision syntax.
+2. `RoomService` loads the authoritative room.
+3. It constructs exactly `expectedRevision + 1`.
+4. `PostgresRoomRepository` executes a parameterized update containing:
+
+```sql
+where id = $4
+  and revision = $5
+```
+
+5. PostgreSQL changes code, language, revision, and `updated_at` only if the stored revision still matches.
+6. The server broadcasts only the row returned by that successful update.
+
+If the revision is stale, the update returns no row. Nothing is broadcast as a success, and the sender receives `room:error` with the latest canonical `editorState`. This prevents two stale updates from both overwriting the same revision.
+
+## Parameterized SQL and Special Source Code
+
+Source code is always passed in the query parameter array, never concatenated into SQL. Quotes, apostrophes, Unicode, newlines, backslashes, and SQL-looking strings remain document content rather than executable SQL.
+
+## Error Boundaries
+
+- Repository methods throw infrastructure errors.
+- `RoomService` preserves not-found and stale-update results without exposing database types.
+- Express handlers log internal errors and return safe `500` JSON.
+- The WebSocket listener attaches `.catch()` to its asynchronous message function, preventing unhandled promise rejections.
+- Database failures never produce a successful broadcast.
+- The shared pool logs unexpected idle-client errors and closes on `SIGINT` or `SIGTERM`.
+
+## Environment and RLS
+
+Required backend environment variable:
+
+```text
+DATABASE_URL=postgresql://...
+```
+
+Optional variables are `PORT` and `CLIENT_ORIGIN`. `DATABASE_URL` belongs only in `app/server/.env`, which is ignored by Git. It must never use a `VITE_` prefix.
+
+RLS remains enabled on `public.rooms`, and no anonymous `using (true)` policy is added. The backend connects directly with the PostgreSQL role encoded in `DATABASE_URL`; the configured role has sufficient server-side table access. The browser has no direct database route or credential.
+
+## Testing Restart Recovery
+
+1. Start backend and frontend.
+2. Create and join a room.
+3. Enter Python code.
+4. Open and join the same URL in another tab.
+5. Confirm edits synchronize.
+6. Record the URL and stop the backend completely.
+7. Restart the backend and reload the URL.
+8. Confirm code and revision were restored.
+9. Join again and confirm new edits synchronize.
+
+Inspect the database with:
+
+```sql
+select id, code, language, revision, created_at, updated_at
+from public.rooms
+order by updated_at desc;
+```
+
+## Where SOLID Principles Were Applied
+
+### Single Responsibility Principle
+
+- `src/config/database.ts` configures and observes one connection pool.
+- `PostgresRoomRepository` contains room SQL and delegates row conversion.
+- `mapRoomRow` performs database-to-domain mapping.
+- `RoomService` coordinates room rules and revision transitions.
+- Express handlers translate HTTP requests and responses.
+- `handleSocketMessage` translates WebSocket messages.
+- `ParticipantStore`, `roomConnections`, and `socketParticipants` own live presence state.
+
+### Open/Closed Principle
+
+`RoomService` accepts `RoomRepository`. Another implementation can be added without rewriting service rules. The production composition uses `PostgresRoomRepository`; focused tests can use `RoomStore`.
+
+### Liskov Substitution Principle
+
+Both repository implementations return promises, return `null` for missing or stale rows, require the next revision to equal the expected revision plus one, and return domain `Room` values. Callers do not check which implementation they received.
+
+### Interface Segregation Principle
+
+`RoomRepository` includes only `create`, `findById`, and `updateEditorState`. Participant, socket, execution, analytics, search, and pagination operations are intentionally excluded.
+
+### Dependency Inversion Principle
+
+`RoomService` imports the `RoomRepository` interface rather than `pg`, `Pool`, Supabase, or `PostgresRoomRepository`. `src/index.ts` selects the concrete repository at the composition root.
+
+## Current Limitations
+
+- Presence is process-local and not coordinated across multiple backend instances.
+- Participants must join again after reload or restart.
+- Whole-document synchronization is simpler than operational transformation or CRDT collaboration and can reject simultaneous edits.
+- There is no authentication, authorization, ownership, expiration, or rate limiting.
+- The frontend is Python-only.
+- Automated backend test infrastructure has not yet been added; current verification uses build checks and focused integration smoke tests.

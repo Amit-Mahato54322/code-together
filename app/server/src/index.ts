@@ -1,11 +1,12 @@
 import express from "express"
 import cors from "cors";
 import { createServer } from "node:http";
-import NodeWebsocket, { WebSocketServer } from "ws";
+import NodeWebsocket, { WebSocketServer, type RawData } from "ws";
 
+import { databasePool } from "./config/database.js";
 import type { ProgrammingLanguage } from "./domain/room.js";
+import { PostgresRoomRepository } from "./repositories/postgresRoomRepository.js";
 import { ParticipantStore } from "./store/participantStore.js";
-import { RoomStore } from "./store/roomStore.js";
 import { RoomService } from "./services/roomService.js";
 
 //create express application
@@ -18,14 +19,15 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
 const MAX_DISPLAY_NAME_LENGTH = 40;
 const MAX_SOURCE_CODE_BYTES = 20 * 1024;
 
-// create our in-memory stores.
-const roomStore = new RoomStore();
+// PostgreSQL owns persistent room state. ParticipantStore owns only temporary
+// presence data for sockets connected to this backend process.
+const roomRepository = new PostgresRoomRepository(databasePool);
 const participantStore = new ParticipantStore();
 
-// give the store to roomservice
-// RoomService contains the actual room business logic.
+// RoomService contains room business logic and depends on the repository
+// contract rather than PostgreSQL directly.
 const roomService = new RoomService(
-    roomStore,
+    roomRepository,
     participantStore
 );
 
@@ -75,6 +77,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isRevision(value: unknown): value is number {
+    return (
+        typeof value === "number" &&
+        Number.isSafeInteger(value) &&
+        value >= 0
+    );
+}
+
+function logServerError(message: string, error: unknown): void {
+    if (error instanceof Error) {
+        console.error(message, error);
+        return;
+    }
+
+    console.error(message, String(error));
+}
+
 // health-check endpoint.
 // GET/health lets us verify that the server is running.
 
@@ -86,7 +105,7 @@ app.get("/health", (_request, response) => (  //_ means it's not being used, int
 
 
 // create a new collaborative room.
-app.post("/rooms", (request, response) => {
+app.post("/rooms", async (request, response) => {
     const body = isRecord(request.body) ? request.body : {};
     const language = body.language;
     const code = body.code ?? "";
@@ -108,16 +127,22 @@ app.post("/rooms", (request, response) => {
         return;
     }
 
-    // if no language was provided, RoomService defaults
-    // the new too to Typescript.
-    const room = roomService.createRoom(language, code);
+    try {
+        // If no language was provided, RoomService uses its default.
+        const room = await roomService.createRoom(language, code);
 
-    //201 means a new resource was successfully created.
-    response.status(201).json(room);
+        // 201 means a new resource was successfully created.
+        response.status(201).json(room);
+    } catch (error: unknown) {
+        logServerError("Could not create room:", error);
+        response.status(500).json({
+            error: "Could not create room",
+        });
+    }
 })
 
 // Get an existing room by its unique room ID.
-app.get("/rooms/:roomId", (request, response) => {
+app.get("/rooms/:roomId", async (request, response) => {
     //Route parameters come from the URL
     //e.g., GET/rooms/abc123
     // request.params.roomID === "abc123"
@@ -129,23 +154,30 @@ app.get("/rooms/:roomId", (request, response) => {
         return;
     }
 
-    const room = roomService.getRoom(roomId)
+    try {
+        const room = await roomService.getRoom(roomId);
 
-    // if RoomService cannot find the room,
-    // return HTTP 404 Not Found.
-    if (!room) {
-        response.status(404).json({
-            error: "Room not found"
-        })
-        return;
+        // If RoomService cannot find the room,
+        // return HTTP 404 Not Found.
+        if (!room) {
+            response.status(404).json({
+                error: "Room not found"
+            })
+            return;
+        }
+
+        response.status(200).json(room);
+    } catch (error: unknown) {
+        logServerError("Could not load room:", error);
+        response.status(500).json({
+            error: "Could not load room",
+        });
     }
-
-    response.status(200).json(room);
 
 })
 
 //Join an existing room as a participant.
-app.post("/rooms/:roomId/join", (request, response) => {
+app.post("/rooms/:roomId/join", async (request, response) => {
     const roomId = request.params.roomId;
     const body = isRecord(request.body) ? request.body : {};
     const displayName = body.displayName;
@@ -168,19 +200,27 @@ app.post("/rooms/:roomId/join", (request, response) => {
 
         return;
     }
-    const participant = roomService.joinRoom(
-        roomId,
-        displayName.trim()
-    );
+    try {
+        const participant = await roomService.joinRoom(
+            roomId,
+            displayName.trim()
+        );
 
-    // joinRoom() returns undefined when the room does not exist.
-    if (!participant) {
-        response.status(404).json({
-            error: "Room not found",
+        // joinRoom() returns null when the room does not exist.
+        if (!participant) {
+            response.status(404).json({
+                error: "Room not found",
+            });
+            return;
+        }
+
+        response.status(201).json(participant)
+    } catch (error: unknown) {
+        logServerError("Could not join room:", error);
+        response.status(500).json({
+            error: "Could not join room",
         });
-        return;
     }
-    response.status(201).json(participant)
 })
 
 //        port 3000
@@ -280,25 +320,34 @@ webSocketServer.on("connection", (socket) => {
 
     sendSocketMessage(socket, { type: "connection:ready" });
 
-    // Runs whenever this browser sends a WebSocket message.
-    socket.on("message", (rawMessage) => {
+    async function handleSocketMessage(rawMessage: RawData): Promise<void> {
+        let parsedMessage: unknown;
+
         try {
             // WebSocket messages arrive as raw data.
             // Convert the message into a string and then parse the JSON.
-            const parsedMessage: unknown = JSON.parse(rawMessage.toString());
+            parsedMessage = JSON.parse(rawMessage.toString());
+        } catch (error: unknown) {
+            logServerError("Invalid WebSocket JSON:", error);
+            sendSocketMessage(socket, {
+                type: "room:error",
+                error: "Invalid WebSocket message",
+            });
+            return;
+        }
 
-            if (
-                !isRecord(parsedMessage) ||
-                typeof parsedMessage.type !== "string"
-            ) {
-                sendSocketMessage(socket, {
-                    type: "room:error",
-                    error: "WebSocket message must include a string type",
-                });
-                return;
-            }
+        if (
+            !isRecord(parsedMessage) ||
+            typeof parsedMessage.type !== "string"
+        ) {
+            sendSocketMessage(socket, {
+                type: "room:error",
+                error: "WebSocket message must include a string type",
+            });
+            return;
+        }
 
-            const message = parsedMessage;
+        const message = parsedMessage;
 
             // --------------------------------------------------
             // 1. ROOM JOIN MESSAGE
@@ -329,15 +378,17 @@ webSocketServer.on("connection", (socket) => {
                     return;
                 }
 
-                const room = roomStore.get(roomId);
-                const participant = participantStore.get(participantId);
+                const room = await roomService.getRoom(roomId);
+                const participant = roomService.getParticipantForRoom(
+                    roomId,
+                    participantId
+                );
 
                 // The room must exist and the participant must
                 // already belong to that room.
                 if (
                     !room ||
-                    !participant ||
-                    !room.participantIds.includes(participantId)
+                    !participant
                 ) {
                     sendSocketMessage(socket, {
                         type: "room:error",
@@ -406,7 +457,7 @@ webSocketServer.on("connection", (socket) => {
             if (message.type === "code:update") {
                 // A socket must join a room before it can send
                 // code updates to that room.
-                if (!joinedRoomId) {
+                if (!joinedRoomId || !joinedParticipantId) {
                     sendSocketMessage(socket, {
                         type: "room:error",
                         error: "Join a room before editing code",
@@ -416,6 +467,7 @@ webSocketServer.on("connection", (socket) => {
                 }
 
                 const newCode = message.code;
+                const expectedRevision = message.revision;
 
                 if (
                     typeof newCode !== "string" ||
@@ -429,9 +481,35 @@ webSocketServer.on("connection", (socket) => {
                     return;
                 }
 
-                const room = roomService.updateCode(joinedRoomId, newCode);
+                if (
+                    expectedRevision !== undefined &&
+                    !isRevision(expectedRevision)
+                ) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Code update revision must be a non-negative integer",
+                    });
+                    return;
+                }
+
+                const room = await roomService.updateCode(
+                    joinedRoomId,
+                    newCode,
+                    expectedRevision
+                );
 
                 if (!room) {
+                    const currentRoom = await roomService.getRoom(joinedRoomId);
+
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: currentRoom
+                            ? "Editor state is out of date"
+                            : "Room not found",
+                        ...(currentRoom
+                            ? { editorState: currentRoom.editorState }
+                            : {}),
+                    });
                     return;
                 }
 
@@ -439,7 +517,8 @@ webSocketServer.on("connection", (socket) => {
                     type: "code:update",
                     code: room.editorState.code,
                     revision: room.editorState.revision,
-                }, socket);
+                    participantId: joinedParticipantId,
+                });
 
                 return;
             }
@@ -464,12 +543,37 @@ webSocketServer.on("connection", (socket) => {
                     return;
                 }
 
-                const room = roomService.updateLanguage(
+                const expectedRevision = message.revision;
+
+                if (
+                    expectedRevision !== undefined &&
+                    !isRevision(expectedRevision)
+                ) {
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: "Language update revision must be a non-negative integer",
+                    });
+                    return;
+                }
+
+                const room = await roomService.updateLanguage(
                     joinedRoomId,
-                    message.language
+                    message.language,
+                    expectedRevision
                 );
 
                 if (!room) {
+                    const currentRoom = await roomService.getRoom(joinedRoomId);
+
+                    sendSocketMessage(socket, {
+                        type: "room:error",
+                        error: currentRoom
+                            ? "Editor state is out of date"
+                            : "Room not found",
+                        ...(currentRoom
+                            ? { editorState: currentRoom.editorState }
+                            : {}),
+                    });
                     return;
                 }
 
@@ -488,17 +592,19 @@ webSocketServer.on("connection", (socket) => {
                 type: "room:error",
                 error: "Unsupported WebSocket message type",
             });
-        } catch (error) {
-            console.error(
-                "Invalid WebSocket message:",
-                error
-            );
+    }
 
+    // EventEmitter does not await asynchronous listeners. Attaching catch()
+    // here prevents database or application failures from becoming unhandled
+    // promise rejections.
+    socket.on("message", (rawMessage) => {
+        void handleSocketMessage(rawMessage).catch((error: unknown) => {
+            logServerError("Could not process WebSocket message:", error);
             sendSocketMessage(socket, {
                 type: "room:error",
-                error: "Invalid WebSocket message",
+                error: "Could not process room message",
             });
-        }
+        });
     });
 
     socket.on("close", () => {
@@ -533,4 +639,31 @@ httpServer.listen(PORT, () => {
 
         `Code together server running on http://localhost:${PORT}`
     );
+});
+
+let isShuttingDown = false;
+
+async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+    if (isShuttingDown) {
+        return;
+    }
+
+    isShuttingDown = true;
+    console.log(`Received ${signal}; closing PostgreSQL pool`);
+
+    try {
+        await databasePool.end();
+        process.exit(0);
+    } catch (error: unknown) {
+        logServerError("Could not close PostgreSQL pool:", error);
+        process.exit(1);
+    }
+}
+
+process.once("SIGINT", () => {
+    void shutdown("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+    void shutdown("SIGTERM");
 });

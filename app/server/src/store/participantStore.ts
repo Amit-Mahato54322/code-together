@@ -1,37 +1,39 @@
 import type { Participant } from "../domain/participant.js";
-export class ParticipantStore{
 
-    // ## separate store to store participants and their information ##
-    // ## gives independent ownership of participant data ##
-    //key -> participant ID
-    //value -> participant object
+interface StoredParticipant {
+  participant: Participant;
+  roomId: string;
+}
 
-    private readonly participants = new Map<string, Participant>();
+/**
+ * Owns temporary participant identity and room membership for this process.
+ * This state intentionally disappears when the backend restarts.
+ */
+export class ParticipantStore {
+  private readonly participants = new Map<string, StoredParticipant>();
 
-    // save a enw participant or replace an existing participant with the same ID.
-    save(participant: Participant):void{
-        this.participants.set(participant.id, participant);
-    }
+  save(roomId: string, participant: Participant): void {
+    this.participants.set(participant.id, {
+      participant,
+      roomId,
+    });
+  }
 
-    //return participant if it exists.
-    // if no participant has this ID, Map.get() returns undefined.
+  get(participantId: string): Participant | undefined {
+    return this.participants.get(participantId)?.participant;
+  }
 
-    get(participantId:string): Participant | undefined{
-        return this.participants.get(participantId);
-    }
+  getByRoomId(roomId: string): Participant[] {
+    return [...this.participants.values()]
+      .filter((storedParticipant) => storedParticipant.roomId === roomId)
+      .map((storedParticipant) => storedParticipant.participant);
+  }
 
-    // check if a participant currently exists in the store.
-    has(participantId: string):boolean{
-        return this.participants.has(participantId);
-    }
+  belongsToRoom(participantId: string, roomId: string): boolean {
+    return this.participants.get(participantId)?.roomId === roomId;
+  }
 
-    //remove a participant from a memory
-    delete(participantId: string): boolean{
-        return this.participants.delete(participantId);
-    }
-
-    // getter to return participantStore.sizxe
-    get size(): number{
-        return this.participants.size;
-    }
+  delete(participantId: string): boolean {
+    return this.participants.delete(participantId);
+  }
 }
