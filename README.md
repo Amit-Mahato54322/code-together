@@ -355,6 +355,3 @@ The design deliberately avoids provider factories, dependency-injection framewor
 - Python execution does not support cancellation, interactive input, package installation, files, or streaming output.
 - Rooms do not currently expire or get deleted automatically.
 
-## Recommended next step
-
-Add lightweight authentication and room access control before public deployment. This would protect room URLs and provide durable participant identity without changing the existing persistence or execution architecture.
